@@ -44,12 +44,13 @@ private:
     std::array<KawaiiVoice, kMaxVoices> voices;
     std::array<ParamValue, kNumParams> params;
 
-    // GPU synthesis
+    // GPU synthesis — hybrid pipeline (GPU sin+sum per-voice, CPU filter per-voice)
     MetalSineBank metalSineBank;
     bool useGPU = false;
     std::vector<OscillatorParams> gpuOscParams;
     std::vector<float> gpuEnvValues;
-    std::vector<float> gpuOutput;
+    std::vector<VoiceDescriptor> gpuVoiceDescs;      // per-voice oscillator ranges
+    std::vector<float> gpuPerVoiceOutput;            // [voiceIdx * maxBlock + sample]
 };
 
 } // namespace Kawaii

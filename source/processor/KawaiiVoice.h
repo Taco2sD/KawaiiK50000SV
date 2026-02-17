@@ -431,6 +431,32 @@ public:
     void setFilterEnvSustain(double lvl) { filterEnvelope.setSustain(lvl); }
     void setFilterEnvRelease(double sec) { filterEnvelope.setRelease(sec); }
 
+    // --- Hybrid GPU+CPU pipeline helpers ---
+    // When GPU computes per-voice partial sums, the processor drives the
+    // filter from outside. These expose per-sample filter state advancement
+    // that normally happens inside process().
+
+    // Advance filter envelope by one sample, return envelope value
+    double processFilterEnvelope() { return filterEnvelope.process(); }
+
+    // Advance cutoff smoother by one sample, return smoothed normalized cutoff
+    double processFilterCutoffSmooth() { return cutoffSmoother.process(); }
+
+    // Advance resonance smoother by one sample, return smoothed resonance
+    double processFilterResoSmooth() { return resoSmoother.process(); }
+
+    // Read-only access to filter modulation depths
+    double getFilterEnvDepth() const { return filterEnvDepth; }
+    double getFilterKeytrack() const { return filterKeytrack; }
+
+    // Apply ZDF SVF to one pre-computed sample (sets coefficients + processes)
+    double applyFilter(double sample, double cutoffHz, double Q)
+    {
+        filter.setCoefficients(sampleRate, cutoffHz, Q);
+        filter.setType(filterType);
+        return filter.processSample(sample);
+    }
+
     // Public so the processor can set per-partial ADSR and level directly
     std::array<Partial, kMaxPartials> partials;
 
