@@ -4,8 +4,10 @@
 
 #include "KawaiiController.h"
 #include "../entry/KawaiiCids.h"
+#include "../editor/KawaiiEditor.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
+#include "pluginterfaces/vst/ivsteditcontroller.h"
 
 namespace Steinberg {
 namespace Vst {
@@ -31,7 +33,7 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
     // --- Per-partial: Level + ADSR (16 partials x 5 params = 80 params) ---
     // Matching the old working Macro loop pattern exactly
 
-    for (int i = 0; i < 12; i++)  // 12 partials = 62 params
+    for (int i = 0; i < kMaxPartials; i++)  // 16 partials = 82 params
     {
         int p = i + 1;
         double defLevel = 1.0 / (i + 1);
@@ -119,8 +121,10 @@ tresult PLUGIN_API KawaiiController::getState(IBStream* state)
     return kResultOk;
 }
 
-IPlugView* PLUGIN_API KawaiiController::createView(FIDString /*name*/)
+IPlugView* PLUGIN_API KawaiiController::createView(FIDString name)
 {
+    if (FIDStringsEqual(name, ViewType::kEditor))
+        return new KawaiiEditor(this);
     return nullptr;
 }
 

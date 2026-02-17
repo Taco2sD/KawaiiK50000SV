@@ -19,13 +19,12 @@
 #
 ##############################################################################
 
-# Minimum CMake version. 3.15 is required for some of the features we use
-# (like generator expressions in custom commands).
-cmake_minimum_required(VERSION 3.15)
+# Minimum CMake version. 3.25 is required by VSTGUI.
+cmake_minimum_required(VERSION 3.25)
 
 # Project metadata. VERSION is used in the bundle's Info.plist.
-# LANGUAGES CXX means we're building C++ code.
-project(KawaiiK50000SV VERSION 1.0.0 LANGUAGES CXX)
+# LANGUAGES CXX OBJCXX — Objective-C++ is required by VSTGUI on macOS.
+project(KawaiiK50000SV VERSION 1.0.0 LANGUAGES CXX OBJCXX)
 
 # We use C++17 features (std::clamp, std::optional, structured bindings, etc.)
 set(CMAKE_CXX_STANDARD 17)
@@ -50,6 +49,19 @@ endif()
 # Add the SDK root to the include path so we can #include its headers
 # with paths like "pluginterfaces/base/funknown.h".
 include_directories(${VST3_SDK_ROOT})
+
+##############################################################################
+# VSTGUI — Steinberg's UI framework (for custom editor)
+##############################################################################
+# Disable standalone/tools/tests — we only need the core vstgui library.
+set(VSTGUI_STANDALONE OFF CACHE BOOL "" FORCE)
+set(VSTGUI_STANDALONE_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(VSTGUI_TOOLS OFF CACHE BOOL "" FORCE)
+set(VSTGUI_DISABLE_UNITTESTS 1)
+
+add_subdirectory(${VST3_SDK_ROOT}/vstgui4/vstgui ${CMAKE_BINARY_DIR}/vstgui)
+
+include_directories(${VST3_SDK_ROOT}/vstgui4)
 
 ##############################################################################
 # VST3 SDK Source Files
@@ -96,6 +108,8 @@ set(VST3_SDK_SOURCES
     ${VST3_SDK_ROOT}/public.sdk/source/vst/vsteditcontroller.cpp   # EditController (our base)
     ${VST3_SDK_ROOT}/public.sdk/source/vst/vstparameters.cpp       # Parameter management
     ${VST3_SDK_ROOT}/public.sdk/source/vst/vstinitiids.cpp         # VST interface IDs
+    ${VST3_SDK_ROOT}/public.sdk/source/vst/vstguieditor.cpp        # VSTGUIEditor base class
+    ${VST3_SDK_ROOT}/public.sdk/source/main/moduleinit.cpp         # Module init (required by vstguieditor)
 )
 
 ##############################################################################
@@ -106,6 +120,7 @@ set(PLUGIN_SOURCES
     source/entry/KawaiiEntry.cpp                # Plugin factory / entry point
     source/processor/KawaiiProcessor.cpp        # Audio processor
     source/controller/KawaiiController.cpp      # Parameter controller
+    source/editor/KawaiiEditor.cpp              # Custom VSTGUI editor
 )
 
 ##############################################################################
@@ -175,12 +190,17 @@ if(APPLE)
     find_library(FOUNDATION_LIBRARY Foundation)
     find_library(COCOA_LIBRARY Cocoa)
     find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox)
+    find_library(QUARTZCORE_LIBRARY QuartzCore)
+    find_library(ACCELERATE_LIBRARY Accelerate)
 
     target_link_libraries(KawaiiK50000SV PRIVATE
         ${COREFOUNDATION_LIBRARY}
         ${FOUNDATION_LIBRARY}
         ${COCOA_LIBRARY}
         ${AUDIOTOOLBOX_LIBRARY}
+        ${QUARTZCORE_LIBRARY}
+        ${ACCELERATE_LIBRARY}
+        vstgui
     )
 endif()
 
