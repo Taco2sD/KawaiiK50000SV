@@ -37,15 +37,8 @@
 using namespace Steinberg::Vst;
 using namespace Steinberg::Vst::Kawaii;
 
-// ============================================================================
-// Module Init / Deinit
-// ============================================================================
-// These functions are called once when the VST3 bundle is loaded into memory
-// (InitModule) and when it's unloaded (DeinitModule). They're required by the
-// VST3 SDK even if you don't need them. Returning true means "success".
-
-bool InitModule()   { return true; }
-bool DeinitModule() { return true; }
+// InitModule() / DeinitModule() are now provided by moduleinit.cpp from the
+// VST3 SDK, which runs the module init list (needed for VSTGUI registration).
 
 // ============================================================================
 // Plugin Factory
