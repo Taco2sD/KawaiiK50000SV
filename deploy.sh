@@ -25,9 +25,9 @@ if pgrep -xq "Live"; then
 
     # Clean quit via Accessibility API.
     # Handles: crash recovery dialog → "No", save dialog → "Don't Save".
-    "${PROJECT_DIR}/scripts/quit_live"
+    "${PROJECT_DIR}/scripts/quit_live" || true  # Don't abort if it times out
 
-    # Wait for exit
+    # Wait for exit (quit_live may return before process fully exits)
     WAIT_START=$SECONDS
     while pgrep -xq "Live"; do
         sleep 1

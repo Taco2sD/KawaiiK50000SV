@@ -92,9 +92,9 @@ if let noBtn = findButtonInWindows(axApp: axApp, desc: "No") {
 log("Sending terminate()")
 live.terminate()
 
-// --- Step 3: Single loop — watch for save dialog AND process exit (up to 60s) ---
-// Ableton can take 20-30s to shut down its audio engine after windows close.
-let deadline = Date().addingTimeInterval(60)
+// --- Step 3: Single loop — watch for save dialog AND process exit ---
+// Ableton can take 20-60s+ to shut down its audio engine/Metal resources.
+let deadline = Date().addingTimeInterval(120)
 var dismissed = false
 var lastWindowCount = -1
 
@@ -120,6 +120,6 @@ while Date() < deadline && isProcessRunning(pid) {
 if !isProcessRunning(pid) {
     log(dismissed ? "Quit OK (dismissed save dialog)" : "Quit OK (clean)")
 } else {
-    log("WARNING: still running after 60s — giving up (NOT killing)")
+    log("WARNING: still running after 120s — giving up (NOT killing)")
     exit(1)
 }
