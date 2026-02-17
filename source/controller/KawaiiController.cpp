@@ -14,31 +14,75 @@ namespace Kawaii {
 KawaiiController::KawaiiController() {}
 KawaiiController::~KawaiiController() {}
 
-// Helper: convert ASCII to char16 for dynamic parameter names
-static void asciiToChar16(const char* src, char16* dst, int dstSize)
-{
-    int i = 0;
-    while (src[i] && i < dstSize - 1)
-    {
-        dst[i] = static_cast<char16>(src[i]);
-        i++;
-    }
-    dst[i] = 0;
-}
-
 tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
 {
     tresult result = EditController::initialize(context);
     if (result != kResultOk)
         return result;
 
-    // --- DIAGNOSTIC: Only 2 global params to test if Ableton shows them ---
+    // --- Global params ---
 
     parameters.addParameter(STR16("Master Volume"), STR16("%"), 0, 0.7,
         ParameterInfo::kCanAutomate, kParamMasterVolume, 0, STR16("Master"));
 
     parameters.addParameter(STR16("Master Tune"), STR16("cents"), 0, 0.5,
         ParameterInfo::kCanAutomate, kParamMasterTune, 0, STR16("Master"));
+
+    // --- Per-partial: Level + ADSR (16 partials x 5 params = 80 params) ---
+    // Matching the old working Macro loop pattern exactly
+
+    for (int i = 0; i < 12; i++)  // 12 partials = 62 params
+    {
+        int p = i + 1;
+        double defLevel = 1.0 / (i + 1);
+        char tempName[32];
+        char16 name[32];
+
+        // Level
+        snprintf(tempName, sizeof(tempName), "P%d Level", p);
+        for (int j = 0; j <= (int)strlen(tempName); j++)
+            name[j] = static_cast<char16>(tempName[j]);
+        parameters.addParameter(name, STR16("%"), 0, defLevel,
+            ParameterInfo::kCanAutomate, partialParam(i, kPartialOffLevel), 0, STR16("Partials"));
+
+        // Attack
+        snprintf(tempName, sizeof(tempName), "P%d Attack", p);
+        for (int j = 0; j <= (int)strlen(tempName); j++)
+            name[j] = static_cast<char16>(tempName[j]);
+        parameters.addParameter(name, STR16("ms"), 0, 0.01,
+            ParameterInfo::kCanAutomate, partialParam(i, kPartialOffAttack), 0, STR16("Partials"));
+
+        // Decay
+        snprintf(tempName, sizeof(tempName), "P%d Decay", p);
+        for (int j = 0; j <= (int)strlen(tempName); j++)
+            name[j] = static_cast<char16>(tempName[j]);
+        parameters.addParameter(name, STR16("ms"), 0, 0.3,
+            ParameterInfo::kCanAutomate, partialParam(i, kPartialOffDecay), 0, STR16("Partials"));
+
+        // Sustain
+        snprintf(tempName, sizeof(tempName), "P%d Sustain", p);
+        for (int j = 0; j <= (int)strlen(tempName); j++)
+            name[j] = static_cast<char16>(tempName[j]);
+        parameters.addParameter(name, STR16("%"), 0, 0.8,
+            ParameterInfo::kCanAutomate, partialParam(i, kPartialOffSustain), 0, STR16("Partials"));
+
+        // Release
+        snprintf(tempName, sizeof(tempName), "P%d Release", p);
+        for (int j = 0; j <= (int)strlen(tempName); j++)
+            name[j] = static_cast<char16>(tempName[j]);
+        parameters.addParameter(name, STR16("ms"), 0, 0.3,
+            ParameterInfo::kCanAutomate, partialParam(i, kPartialOffRelease), 0, STR16("Partials"));
+    }
+
+    // 4 dummies: 66 total params, max ID 65
+    parameters.addParameter(STR16("Dummy A"), STR16("%"), 0, 0.5,
+        ParameterInfo::kCanAutomate, 62, 0, STR16("Test"));
+    parameters.addParameter(STR16("Dummy B"), STR16("%"), 0, 0.5,
+        ParameterInfo::kCanAutomate, 63, 0, STR16("Test"));
+    parameters.addParameter(STR16("Dummy C"), STR16("%"), 0, 0.5,
+        ParameterInfo::kCanAutomate, 64, 0, STR16("Test"));
+    parameters.addParameter(STR16("Dummy D"), STR16("%"), 0, 0.5,
+        ParameterInfo::kCanAutomate, 65, 0, STR16("Test"));
 
     return kResultOk;
 }
@@ -54,8 +98,7 @@ tresult PLUGIN_API KawaiiController::setComponentState(IBStream* state)
     if (!state)
         return kResultFalse;
 
-    // DIAGNOSTIC: only read the 2 registered params
-    for (int32 i = 0; i < 2; i++)
+    for (int32 i = 0; i < kNumParams; i++)
     {
         float value;
         int32 numBytesRead;
@@ -76,8 +119,7 @@ tresult PLUGIN_API KawaiiController::getState(IBStream* state)
     if (!state)
         return kResultFalse;
 
-    // DIAGNOSTIC: only write the 2 registered params
-    for (int32 i = 0; i < 2; i++)
+    for (int32 i = 0; i < kNumParams; i++)
     {
         float value = static_cast<float>(getParamNormalized(i));
         int32 numBytesWritten;
