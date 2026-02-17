@@ -316,7 +316,7 @@ class KawaiiVoice
 public:
     KawaiiVoice()
         : noteNumber(-1), velocity(0.0), sampleRate(44100.0)
-        , cutoffSmoother(20000.0), resoSmoother(0.0)
+        , cutoffSmoother(1.0), resoSmoother(0.0)
         , filterEnvDepth(0.0), filterKeytrack(0.0)
         , filterType(kFilterLP)
     {}
@@ -376,9 +376,17 @@ public:
         // 2. Apply ZDF SVF filter with per-sample smoothed parameters
         double envValue = filterEnvelope.process();
 
-        // Smooth cutoff and reso to avoid stepping when user moves knobs
-        double smoothedCutoff = cutoffSmoother.process();
-        double smoothedReso   = resoSmoother.process();
+        // Smooth cutoff in NORMALIZED space (0–1) for perceptually uniform
+        // interpolation. Converting to Hz after smoothing ensures that small
+        // knob movements at any position produce smooth, even sweeps.
+        // (Smoothing in Hz space caused audible steps at high frequencies
+        // because exponential mapping amplifies small normalized changes.)
+        double smoothedNorm = cutoffSmoother.process();
+        double smoothedReso = resoSmoother.process();
+
+        // Convert smoothed normalized cutoff to Hz (exponential mapping)
+        // 20 * 1000^norm: norm=0 → 20 Hz, norm=0.5 → 632 Hz, norm=1 → 20 kHz
+        double baseCutoffHz = 20.0 * std::pow(1000.0, smoothedNorm);
 
         // Env depth is bipolar: -1.0 to +1.0 — modulates cutoff by up to ±10kHz
         double envMod = filterEnvDepth * envValue * 10000.0;
@@ -386,7 +394,7 @@ public:
         // Keytrack: 0 = no tracking, 1 = full (100 Hz/semitone from C3 = MIDI 60)
         double keyMod = filterKeytrack * (noteNumber - 60) * 100.0;
 
-        double effectiveCutoff = std::clamp(smoothedCutoff + envMod + keyMod, 20.0, 20000.0);
+        double effectiveCutoff = std::clamp(baseCutoffHz + envMod + keyMod, 20.0, 20000.0);
 
         // Map smoothed resonance (0–1) to Q (0.5–25)
         double Q = 0.5 + smoothedReso * 24.5;
@@ -410,8 +418,9 @@ public:
     double getVelocity() const { return velocity; }
 
     // --- Filter parameter setters (called by processor each block) ---
-    // Cutoff and reso go through smoothers for click-free knob movement
-    void setFilterCutoff(double hz)      { cutoffSmoother.setTarget(hz); }
+    // Cutoff is smoothed in normalized (0–1) space, then converted to Hz per-sample.
+    // This eliminates stepping because the smoothing is perceptually uniform.
+    void setFilterCutoffNorm(double norm) { cutoffSmoother.setTarget(norm); }
     void setFilterResonance(double res)  { resoSmoother.setTarget(res); }
     void setFilterEnvDepth(double depth) { filterEnvDepth = depth; }
     void setFilterKeytrack(double amt)   { filterKeytrack = amt; }
@@ -433,7 +442,7 @@ private:
     // Filter state (per-voice)
     ZdfSvf filter;
     ADSREnvelope filterEnvelope;
-    ParamSmoother cutoffSmoother;   // smoothed cutoff in Hz
+    ParamSmoother cutoffSmoother;   // smoothed cutoff in normalized 0–1
     ParamSmoother resoSmoother;     // smoothed resonance 0–1
     double filterEnvDepth;          // bipolar: -1.0 to +1.0
     double filterKeytrack;          // 0.0 to 1.0

@@ -6,6 +6,8 @@
 #include "vstgui/lib/controls/coptionmenu.h"
 #include "vstgui/lib/cframe.h"
 
+#include <cstdio>
+
 namespace Steinberg {
 namespace Vst {
 namespace Kawaii {
@@ -14,12 +16,14 @@ using namespace VSTGUI;
 
 // Layout constants — 4 groups of 8 partials + filter strip at bottom
 static constexpr int kWindowW = 1280;
-static constexpr int kWindowH = 520;
+static constexpr int kWindowH = 580;
 
 // Partial knob sizes
 static constexpr int kKnobSize = 28;
-static constexpr int kLabelH = 11;
-static constexpr int kRowH = kKnobSize + kLabelH + 4;   // 43px per row
+static constexpr int kLabelH = 11;       // name label height
+static constexpr int kValueLabelH = 10;  // value display height
+// Row = knob + name + value + gap
+static constexpr int kRowH = kKnobSize + kLabelH + kValueLabelH + 3;  // 52px per row
 static constexpr int kColW = 56;
 static constexpr int kRowLabelW = 28;
 
@@ -40,10 +44,13 @@ static constexpr int kGroup3Left = kGroup2Left + kGroupW + kGroupGap;
 static constexpr int kGroup4Left = kGroup3Left + kGroupW + kGroupGap;
 
 // Filter section — horizontal strip below the partial grid
-static constexpr int kGridBottom = kGridTop + kPartialsPerGroup * kRowH;  // 52 + 344 = 396
-static constexpr int kFilterY = kGridBottom + 14;  // 410
+static constexpr int kGridBottom = kGridTop + kPartialsPerGroup * kRowH;  // 52 + 416 = 468
+static constexpr int kFilterY = kGridBottom + 14;  // 482
 static constexpr int kFilterKnobSize = 32;
 static constexpr int kFilterColW = 62;
+
+// Zoom factor for shift+drag fine control: higher = finer when dragging far from knob
+static constexpr float kKnobZoomFactor = 8.0f;
 
 KawaiiEditor::KawaiiEditor(void* controller)
     : VSTGUIEditor(static_cast<EditController*>(controller))
@@ -60,6 +67,7 @@ bool PLUGIN_API KawaiiEditor::open(void* parent, const PlatformType& platformTyp
     frame = new CFrame(frameSize, this);
     frame->setBackgroundColor(CColor(30, 30, 36, 255));
 
+    valueLabels.clear();
     createControls();
 
     if (frame && frame->open(parent, platformType))
@@ -70,6 +78,7 @@ bool PLUGIN_API KawaiiEditor::open(void* parent, const PlatformType& platformTyp
 
 void PLUGIN_API KawaiiEditor::close()
 {
+    valueLabels.clear();  // pointers owned by frame, will be deleted with it
     if (frame)
     {
         frame->forget();
@@ -87,6 +96,22 @@ void KawaiiEditor::valueChanged(CControl* control)
         getController()->setParamNormalized(tag, value);
         getController()->performEdit(tag, value);
     }
+
+    // Update the value display label for this parameter
+    updateValueLabel(tag, value);
+}
+
+void KawaiiEditor::updateValueLabel(Vst::ParamID tag, double value)
+{
+    auto it = valueLabels.find(static_cast<int32>(tag));
+    if (it == valueLabels.end())
+        return;
+
+    // Format with up to 6 significant digits — compact for round values,
+    // precise enough to see small partial levels like 0.03125
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.6g", value);
+    it->second->setText(buf);
 }
 
 void KawaiiEditor::createControls()
@@ -94,6 +119,7 @@ void KawaiiEditor::createControls()
     if (!frame) return;
 
     CColor labelColor(190, 190, 200, 255);
+    CColor valueColor(130, 130, 145, 255);  // dimmer than name labels
     CColor titleColor(255, 160, 210, 255);   // kawaii pink
     CColor headerColor(140, 140, 160, 255);
     CColor knobCorona(255, 140, 200, 255);   // pink arc
@@ -101,9 +127,8 @@ void KawaiiEditor::createControls()
     CColor knobDot(255, 180, 220, 255);      // pink dot handle
     CColor filterCorona(100, 200, 255, 255); // blue arc for filter
     CColor filterDot(140, 220, 255, 255);    // blue dot for filter
-    CColor filterBg(38, 38, 48, 255);        // slightly lighter bg for filter strip
 
-    // --- Helper: create a styled corona knob with label below ---
+    // --- Helper: create a styled corona knob with name label + value label below ---
     auto makeKnob = [&](const char* name, ParamID tag, int x, int y,
                         int size, CColor corona, CColor dot) {
         CRect knobRect(x, y, x + size, y + size);
@@ -121,12 +146,20 @@ void KawaiiEditor::createControls()
         knob->setColorShadowHandle(knobTrack);
         knob->setColorHandle(dot);
 
+        // Zoom factor: dragging further from knob center = finer control.
+        // Combined with shift key, this gives very precise adjustment.
+        knob->setZoomFactor(kKnobZoomFactor);
+
+        float initValue = 0.0f;
         if (getController())
-            knob->setValue(static_cast<float>(getController()->getParamNormalized(tag)));
+        {
+            initValue = static_cast<float>(getController()->getParamNormalized(tag));
+            knob->setValue(initValue);
+        }
 
         frame->addView(knob);
 
-        // Label below
+        // Name label below knob
         CRect labelRect(x - 10, y + size + 1, x + size + 10, y + size + 1 + kLabelH);
         auto* label = new CTextLabel(labelRect, name);
         label->setFontColor(labelColor);
@@ -135,6 +168,22 @@ void KawaiiEditor::createControls()
         label->setFont(kNormalFontVerySmall);
         label->setHoriAlign(CHoriTxtAlign::kCenterText);
         frame->addView(label);
+
+        // Value label below name label — shows normalized value with 6 sig digits
+        int valY = y + size + 1 + kLabelH;
+        CRect valRect(x - 12, valY, x + size + 12, valY + kValueLabelH);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.6g", static_cast<double>(initValue));
+        auto* valLabel = new CTextLabel(valRect, buf);
+        valLabel->setFontColor(valueColor);
+        valLabel->setBackColor(CColor(0, 0, 0, 0));
+        valLabel->setFrameColor(CColor(0, 0, 0, 0));
+        valLabel->setFont(kNormalFontVerySmall);
+        valLabel->setHoriAlign(CHoriTxtAlign::kCenterText);
+        frame->addView(valLabel);
+
+        // Store reference so valueChanged can update it
+        valueLabels[static_cast<int32>(tag)] = valLabel;
     };
 
     auto partialKnob = [&](const char* name, ParamID tag, int x, int y) {

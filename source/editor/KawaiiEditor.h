@@ -2,6 +2,9 @@
 
 #include "public.sdk/source/vst/vstguieditor.h"
 #include "../entry/KawaiiCids.h"
+#include <unordered_map>
+
+namespace VSTGUI { class CTextLabel; }
 
 namespace Steinberg {
 namespace Vst {
@@ -21,6 +24,10 @@ public:
 
 private:
     void createControls();
+    void updateValueLabel(Vst::ParamID tag, double value);
+
+    // Map from param ID to its value display label, so valueChanged can update it
+    std::unordered_map<int32, VSTGUI::CTextLabel*> valueLabels;
 };
 
 } // namespace Kawaii

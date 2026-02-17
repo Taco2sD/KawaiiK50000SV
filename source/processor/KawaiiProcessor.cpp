@@ -123,9 +123,10 @@ void KawaiiProcessor::updateParameters()
     using namespace ParamRanges;
 
     // --- Filter params (shared across all voices) ---
-    // Convert normalized cutoff to Hz (exponential mapping)
-    double filterCutoffHz = normalizedToHz(params[kParamFilterCutoff], kFilterCutoffMin, kFilterCutoffMax);
-    double filterReso     = params[kParamFilterReso];
+    // Pass normalized cutoff directly — voice smooths in normalized space
+    // then converts to Hz per-sample for perceptually uniform sweeps
+    double filterCutoffNorm = params[kParamFilterCutoff];
+    double filterReso       = params[kParamFilterReso];
 
     // Filter type: discrete 0–3 mapped from normalized 0–1
     int filterTypeInt = static_cast<int>(params[kParamFilterType] * (kNumFilterTypes - 1) + 0.5);
@@ -163,7 +164,7 @@ void KawaiiProcessor::updateParameters()
         }
 
         // --- Filter params ---
-        voice.setFilterCutoff(filterCutoffHz);
+        voice.setFilterCutoffNorm(filterCutoffNorm);
         voice.setFilterResonance(filterReso);
         voice.setFilterType(filterType);
         voice.setFilterEnvAttack(fAtk);
