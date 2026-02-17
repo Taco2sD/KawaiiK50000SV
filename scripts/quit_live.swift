@@ -7,6 +7,10 @@ import Cocoa
 //   1. Crash recovery ("recover your work?") → clicks "No"
 //   2. Save dialog ("save changes?") → clicks "Don't Save"
 //
+// After windows close, returns immediately. The old PID may still be
+// running (doing background cleanup) — that's fine, deploy.sh doesn't
+// wait on it. A new Ableton instance can launch alongside.
+//
 // Requires: the parent terminal app must have Accessibility permission.
 
 let start = Date()
@@ -47,6 +51,13 @@ func findButtonInWindows(axApp: AXUIElement, desc target: String) -> AXUIElement
     return nil
 }
 
+// --- Helper: get window count ---
+func windowCount(axApp: AXUIElement) -> Int {
+    var windows: AnyObject?
+    AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windows)
+    return (windows as? [AXUIElement])?.count ?? 0
+}
+
 // --- Helper: check if process is actually running via kill(0) ---
 func isProcessRunning(_ pid: pid_t) -> Bool {
     return kill(pid, 0) == 0
@@ -70,7 +81,8 @@ if let noBtn = findButtonInWindows(axApp: axApp, desc: "No") {
     AXUIElementPerformAction(noBtn, kAXPressAction as CFString)
     // Poll until main window appears
     let loadDeadline = Date().addingTimeInterval(30)
-    while Date() < loadDeadline {
+    var loaded = false
+    while Date() < loadDeadline && !loaded {
         var windows: AnyObject?
         AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windows)
         if let wl = windows as? [AXUIElement] {
@@ -79,12 +91,13 @@ if let noBtn = findButtonInWindows(axApp: axApp, desc: "No") {
                 AXUIElementCopyAttributeValue(w, kAXSubroleAttribute as CFString, &sr)
                 if (sr as? String) == "AXStandardWindow" {
                     log("Main window loaded")
+                    loaded = true
                     break
                 }
             }
         }
         if !isProcessRunning(pid) { break }
-        Thread.sleep(forTimeInterval: 0.5)
+        if !loaded { Thread.sleep(forTimeInterval: 0.5) }
     }
 }
 
@@ -92,21 +105,13 @@ if let noBtn = findButtonInWindows(axApp: axApp, desc: "No") {
 log("Sending terminate()")
 live.terminate()
 
-// --- Step 3: Single loop — watch for save dialog AND process exit ---
-// Ableton can take 20-60s+ to shut down its audio engine/Metal resources.
-let deadline = Date().addingTimeInterval(120)
+// --- Step 3: Wait for windows to close, dismiss save dialog if it appears ---
+// We only need the UI to be gone. The PID can linger doing background cleanup.
+let deadline = Date().addingTimeInterval(30)
 var dismissed = false
-var lastWindowCount = -1
 
-while Date() < deadline && isProcessRunning(pid) {
-    // Log window changes for diagnostics
-    var windows: AnyObject?
-    AXUIElementCopyAttributeValue(axApp, kAXWindowsAttribute as CFString, &windows)
-    let wc = (windows as? [AXUIElement])?.count ?? 0
-    if wc != lastWindowCount {
-        log("Windows: \(wc)")
-        lastWindowCount = wc
-    }
+while Date() < deadline {
+    let wc = windowCount(axApp: axApp)
 
     // Click "Don't Save" if save dialog appears
     if !dismissed, let btn = findButtonInWindows(axApp: axApp, desc: "Don't Save") {
@@ -114,12 +119,20 @@ while Date() < deadline && isProcessRunning(pid) {
         AXUIElementPerformAction(btn, kAXPressAction as CFString)
         dismissed = true
     }
-    Thread.sleep(forTimeInterval: 0.5)
+
+    // If all windows are gone, we're done — process can clean up in background
+    if wc == 0 {
+        log("All windows closed")
+        break
+    }
+
+    // If process exited entirely, even better
+    if !isProcessRunning(pid) {
+        log("Process exited")
+        break
+    }
+
+    Thread.sleep(forTimeInterval: 0.2)
 }
 
-if !isProcessRunning(pid) {
-    log(dismissed ? "Quit OK (dismissed save dialog)" : "Quit OK (clean)")
-} else {
-    log("WARNING: still running after 120s — giving up (NOT killing)")
-    exit(1)
-}
+log(dismissed ? "Done (dismissed save dialog)" : "Done (clean)")

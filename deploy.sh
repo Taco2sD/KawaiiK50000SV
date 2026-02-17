@@ -25,15 +25,15 @@ if pgrep -xq "Live"; then
 
     # Clean quit via Accessibility API.
     # Handles: crash recovery dialog → "No", save dialog → "Don't Save".
-    "${PROJECT_DIR}/scripts/quit_live" || true  # Don't abort if it times out
+    QUIT_START=$SECONDS
+    "${PROJECT_DIR}/scripts/quit_live"
 
-    # Wait for exit (quit_live may return before process fully exits)
-    WAIT_START=$SECONDS
+    # Poll until process is fully gone (0.5s intervals).
+    # Ableton's audio engine takes ~60s to tear down after windows close.
     while pgrep -xq "Live"; do
-        sleep 1
+        sleep 0.5
     done
-
-    echo "  Done. (process exited after $((SECONDS - WAIT_START))s)"
+    echo "  Quit took $((SECONDS - QUIT_START))s"
     echo ""
 fi
 
@@ -62,7 +62,6 @@ if [ -d "$ABLETON_APP" ]; then
     fi
 
     # Dismiss crash recovery dialog if it appears on launch
-    echo "  Waiting for Ableton to load..."
     "${PROJECT_DIR}/scripts/dismiss_recovery"
 else
     echo "Ableton not found at ${ABLETON_APP}"
