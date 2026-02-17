@@ -1,12 +1,10 @@
 /**
- * KawaiiProcessor.cpp — K50V: 16-partial additive synth with per-partial ADSR
+ * KawaiiProcessor.cpp — K50V: 32-partial additive synth with ZDF SVF filter
  *
- * Supports two render paths:
- *   GPU (Metal compute) — sin() + summation on Apple Silicon GPU
- *   CPU (fallback)      — original per-sample loop
- *
- * ADSR envelopes always run on CPU (cheap, stateful).
- * Phase tracking uses double precision on CPU; GPU receives float32 per block.
+ * Currently uses CPU-only rendering. The Metal GPU path sums all voices
+ * into a single output, which prevents per-voice filtering. CPU handles
+ * 32 partials × 6 voices easily (~8.5M sin/s vs 200M+ CPU capacity).
+ * GPU path preserved for future per-voice refactoring.
  */
 
 #include "KawaiiProcessor.h"
@@ -38,6 +36,17 @@ KawaiiProcessor::KawaiiProcessor()
         params[partialParam(i, kPartialOffSustain)] = 0.8;
         params[partialParam(i, kPartialOffRelease)] = 0.3;
     }
+
+    // Filter defaults: fully open LP, no modulation
+    params[kParamFilterType]    = 0.0;   // LP
+    params[kParamFilterCutoff]  = ParamRanges::kFilterCutoffDefault;  // 1.0 = 20kHz (fully open)
+    params[kParamFilterReso]    = ParamRanges::kFilterResoDefault;    // 0.0 = no resonance
+    params[kParamFilterEnvAtk]  = 0.01;
+    params[kParamFilterEnvDec]  = 0.3;
+    params[kParamFilterEnvSus]  = 0.0;
+    params[kParamFilterEnvRel]  = 0.3;
+    params[kParamFilterEnvDep]  = ParamRanges::kFilterEnvDepthDefault;  // 0.5 = no modulation
+    params[kParamFilterKeytrk]  = ParamRanges::kFilterKeytrackDefault;  // 0.0 = no tracking
 }
 
 KawaiiProcessor::~KawaiiProcessor()
@@ -69,14 +78,17 @@ tresult PLUGIN_API KawaiiProcessor::setActive(TBool state)
         for (auto& voice : voices)
             voice.setSampleRate(processSetup.sampleRate);
 
-        // Initialize Metal GPU compute
+        // GPU disabled for now — per-voice filtering requires CPU path.
+        // Metal GPU path sums all voices together, preventing per-voice filter.
+        // Keeping the init code so GPU can be re-enabled after refactoring.
+        useGPU = false;
+
         int maxOsc = kMaxVoices * kMaxPartials;
         int maxBlock = (int)processSetup.maxSamplesPerBlock;
         if (maxBlock <= 0) maxBlock = 4096;
 
-        useGPU = metalSineBank.init(maxOsc, maxBlock);
-
-        // Allocate scratch buffers for GPU path
+        // Still allocate GPU buffers in case we re-enable later
+        metalSineBank.init(maxOsc, maxBlock);
         gpuOscParams.resize((size_t)maxOsc);
         gpuEnvValues.resize((size_t)(maxOsc * maxBlock));
         gpuOutput.resize((size_t)maxBlock);
@@ -110,8 +122,29 @@ void KawaiiProcessor::updateParameters()
 {
     using namespace ParamRanges;
 
+    // --- Filter params (shared across all voices) ---
+    // Convert normalized cutoff to Hz (exponential mapping)
+    double filterCutoffHz = normalizedToHz(params[kParamFilterCutoff], kFilterCutoffMin, kFilterCutoffMax);
+    double filterReso     = params[kParamFilterReso];
+
+    // Filter type: discrete 0–3 mapped from normalized 0–1
+    int filterTypeInt = static_cast<int>(params[kParamFilterType] * (kNumFilterTypes - 1) + 0.5);
+    FilterType filterType = static_cast<FilterType>(std::clamp(filterTypeInt, 0, kNumFilterTypes - 1));
+
+    // Filter envelope ADSR (same exponential time mapping as partial envelopes)
+    double fAtk = normalizedToMs(params[kParamFilterEnvAtk], kEnvAttackMin, kEnvAttackMax) / 1000.0;
+    double fDec = normalizedToMs(params[kParamFilterEnvDec], kEnvDecayMin, kEnvDecayMax) / 1000.0;
+    double fSus = params[kParamFilterEnvSus];
+    double fRel = normalizedToMs(params[kParamFilterEnvRel], kEnvReleaseMin, kEnvReleaseMax) / 1000.0;
+
+    // Env depth: normalized 0–1 → bipolar -1 to +1 (0.5 = no modulation)
+    double filterEnvDepth = (params[kParamFilterEnvDep] - 0.5) * 2.0;
+
+    double filterKeytrack = params[kParamFilterKeytrk];
+
     for (auto& voice : voices)
     {
+        // --- Per-partial params ---
         for (int i = 0; i < kMaxPartials; i++)
         {
             // Level
@@ -128,6 +161,17 @@ void KawaiiProcessor::updateParameters()
             voice.partials[i].envelope.setSustain(sLvl);
             voice.partials[i].envelope.setRelease(rSec);
         }
+
+        // --- Filter params ---
+        voice.setFilterCutoff(filterCutoffHz);
+        voice.setFilterResonance(filterReso);
+        voice.setFilterType(filterType);
+        voice.setFilterEnvAttack(fAtk);
+        voice.setFilterEnvDecay(fDec);
+        voice.setFilterEnvSustain(fSus);
+        voice.setFilterEnvRelease(fRel);
+        voice.setFilterEnvDepth(filterEnvDepth);
+        voice.setFilterKeytrack(filterKeytrack);
     }
 }
 
@@ -173,7 +217,7 @@ void KawaiiProcessor::processEvent(const Event& event)
 }
 
 // ============================================================================
-// GPU render path
+// GPU render path (currently disabled — needs per-voice refactoring for filter)
 // ============================================================================
 
 void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)
@@ -226,7 +270,7 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
 }
 
 // ============================================================================
-// CPU render path (fallback)
+// CPU render path — includes per-voice ZDF SVF filter
 // ============================================================================
 
 void KawaiiProcessor::processBlockCPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)

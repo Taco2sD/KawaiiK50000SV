@@ -1,9 +1,10 @@
 /**
- * KawaiiController.cpp — K50V: Register per-partial level + ADSR params
+ * KawaiiController.cpp — K50V: Register 32-partial + filter params
  */
 
 #include "KawaiiController.h"
 #include "../entry/KawaiiCids.h"
+#include "../params/KawaiiParams.h"
 #include "../editor/KawaiiEditor.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
@@ -30,10 +31,9 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
     parameters.addParameter(STR16("Master Tune"), STR16("cents"), 0, 0.5,
         ParameterInfo::kCanAutomate, kParamMasterTune, 0, STR16("Master"));
 
-    // --- Per-partial: Level + ADSR (16 partials x 5 params = 80 params) ---
-    // Matching the old working Macro loop pattern exactly
+    // --- Per-partial: Level + ADSR (32 partials x 5 params = 160 params) ---
 
-    for (int i = 0; i < kMaxPartials; i++)  // 16 partials = 82 params
+    for (int i = 0; i < kMaxPartials; i++)
     {
         int p = i + 1;
         double defLevel = 1.0 / (i + 1);
@@ -75,6 +75,47 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
         parameters.addParameter(name, STR16("ms"), 0, 0.3,
             ParameterInfo::kCanAutomate, partialParam(i, kPartialOffRelease), 0, STR16("Partials"));
     }
+
+    // --- Filter section (9 params) ---
+    using namespace ParamRanges;
+
+    // Filter Type — discrete list param: LP, HP, BP, Notch
+    auto* typeParam = new StringListParameter(
+        STR16("Filter Type"), kParamFilterType, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    typeParam->appendString(STR16("Low Pass"));
+    typeParam->appendString(STR16("High Pass"));
+    typeParam->appendString(STR16("Band Pass"));
+    typeParam->appendString(STR16("Notch"));
+    parameters.addParameter(typeParam);
+
+    // Cutoff (normalized 0–1, exponential mapping 20Hz–20kHz in processor)
+    parameters.addParameter(STR16("Filter Cutoff"), STR16("Hz"), 0, kFilterCutoffDefault,
+        ParameterInfo::kCanAutomate, kParamFilterCutoff, 0, STR16("Filter"));
+
+    // Resonance (0–1)
+    parameters.addParameter(STR16("Filter Reso"), STR16("%"), 0, kFilterResoDefault,
+        ParameterInfo::kCanAutomate, kParamFilterReso, 0, STR16("Filter"));
+
+    // Filter Envelope ADSR
+    parameters.addParameter(STR16("Flt Env Atk"), STR16("ms"), 0, 0.01,
+        ParameterInfo::kCanAutomate, kParamFilterEnvAtk, 0, STR16("Filter"));
+
+    parameters.addParameter(STR16("Flt Env Dec"), STR16("ms"), 0, 0.3,
+        ParameterInfo::kCanAutomate, kParamFilterEnvDec, 0, STR16("Filter"));
+
+    parameters.addParameter(STR16("Flt Env Sus"), STR16("%"), 0, 0.0,
+        ParameterInfo::kCanAutomate, kParamFilterEnvSus, 0, STR16("Filter"));
+
+    parameters.addParameter(STR16("Flt Env Rel"), STR16("ms"), 0, 0.3,
+        ParameterInfo::kCanAutomate, kParamFilterEnvRel, 0, STR16("Filter"));
+
+    // Env Depth (bipolar: 0.5 = no modulation)
+    parameters.addParameter(STR16("Flt Env Depth"), STR16("%"), 0, kFilterEnvDepthDefault,
+        ParameterInfo::kCanAutomate, kParamFilterEnvDep, 0, STR16("Filter"));
+
+    // Keytrack (0 = none, 1 = full)
+    parameters.addParameter(STR16("Flt Keytrack"), STR16("%"), 0, kFilterKeytrackDefault,
+        ParameterInfo::kCanAutomate, kParamFilterKeytrk, 0, STR16("Filter"));
 
     return kResultOk;
 }

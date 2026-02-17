@@ -113,6 +113,28 @@ namespace ParamRanges
     // --- Master volume ---
     constexpr double kMasterVolMin  = 0.0;       // Silence
     constexpr double kMasterVolMax  = 1.0;       // Unity gain
+
+    // --- Filter cutoff frequency (Hz) ---
+    // Exponential mapping: knob at 0 = 20 Hz, knob at 1 = 20 kHz
+    constexpr double kFilterCutoffMin = 20.0;
+    constexpr double kFilterCutoffMax = 20000.0;
+
+    // --- Filter cutoff default (normalized) ---
+    // Default fully open so the filter is transparent until user adjusts it
+    constexpr double kFilterCutoffDefault = 1.0;
+
+    // --- Filter resonance ---
+    // Stored as 0–1 normalized. Mapped to Q in the voice:
+    //   Q = 0.5 + reso * 24.5  (range: 0.5 to 25)
+    constexpr double kFilterResoDefault = 0.0;
+
+    // --- Filter envelope depth ---
+    // Bipolar: 0.0 = full negative, 0.5 = no modulation, 1.0 = full positive
+    constexpr double kFilterEnvDepthDefault = 0.5;
+
+    // --- Filter keytrack ---
+    // 0 = no tracking, 1 = full tracking (100 Hz/semitone from C3)
+    constexpr double kFilterKeytrackDefault = 0.0;
 }
 
 } // namespace Kawaii

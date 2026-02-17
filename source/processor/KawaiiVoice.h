@@ -1,14 +1,17 @@
 /**
- * KawaiiVoice.h — 16-Partial Additive Voice with Per-Partial ADSR
+ * KawaiiVoice.h — 32-Partial Additive Voice with Per-Partial ADSR + ZDF SVF Filter
  *
- * Each voice has 16 sine oscillators in a harmonic series.
+ * Each voice has 32 sine oscillators in a harmonic series.
  * Each partial has its own:
  *   - Level (gain knob)
  *   - ADSR envelope (independent shaping per harmonic)
  *
- * This means you can make the fundamental sustain forever while the
- * upper harmonics decay quickly (organ-like), or have a bright attack
- * that mellows out (piano-like), etc.
+ * After the partials are summed, the signal passes through a Cytomic ZDF
+ * State Variable Filter (LP/HP/BP/Notch) with its own ADSR envelope,
+ * envelope depth, and keyboard tracking.
+ *
+ * ZDF SVF reference: Andy Simper / Cytomic
+ * https://cytomic.com/files/dsp/SvfLinearTrapOptimised2.pdf
  */
 
 #pragma once
@@ -23,7 +26,7 @@ namespace Vst {
 namespace Kawaii {
 
 // ============================================================================
-// ADSR Envelope — one per partial
+// ADSR Envelope — used for both per-partial amp and the filter
 // ============================================================================
 
 class ADSREnvelope
@@ -84,6 +87,82 @@ private:
 };
 
 // ============================================================================
+// Cytomic ZDF State Variable Filter (2-pole, 12dB/oct)
+//
+// Topology-Preserving Transform (TPT) with trapezoidal integration.
+// One computation gives LP, HP, BP, or Notch — selected via mix coefficients.
+// Stable under fast modulation, no artifacts from parameter changes.
+//
+// Reference: Andy Simper, "Linear Trapezoidal Integrated SVF"
+// https://cytomic.com/files/dsp/SvfLinearTrapOptimised2.pdf
+// ============================================================================
+
+class ZdfSvf
+{
+public:
+    ZdfSvf()
+        : g(0.0), k(0.0), a1(0.0), a2(0.0), a3(0.0)
+        , m0(0.0), m1(0.0), m2(1.0)  // default: lowpass
+        , ic1eq(0.0), ic2eq(0.0)
+    {}
+
+    // Compute filter coefficients from frequency and Q.
+    // Call this every sample (or at least every time cutoff/reso changes).
+    // g = tan(π * freq / sampleRate) — the bilinear/trapezoidal warping
+    // k = 1/Q — damping factor (higher k = less resonance)
+    void setCoefficients(double sampleRate, double freq, double Q)
+    {
+        g = std::tan(M_PI * std::clamp(freq, 20.0, 20000.0) / sampleRate);
+        k = 1.0 / std::max(Q, 0.5);
+        a1 = 1.0 / (1.0 + g * (g + k));
+        a2 = g * a1;
+        a3 = g * a2;
+    }
+
+    // Set the filter type via mix coefficients.
+    // The output is: m0*v0 + m1*v1 + m2*v2
+    // where v0=input, v1=bandpass, v2=lowpass
+    void setType(FilterType type)
+    {
+        switch (type)
+        {
+            case kFilterLP:    m0 = 0.0;  m1 = 0.0;  m2 = 1.0;  break;
+            case kFilterHP:    m0 = 1.0;  m1 = -k;   m2 = -1.0; break;
+            case kFilterBP:    m0 = 0.0;  m1 = k;    m2 = 0.0;  break;
+            case kFilterNotch: m0 = 1.0;  m1 = -k;   m2 = 0.0;  break;
+            default:           m0 = 0.0;  m1 = 0.0;  m2 = 1.0;  break;
+        }
+    }
+
+    // Process one sample through the filter.
+    // This is the core ZDF tick — two trapezoidal integrators with feedback.
+    double processSample(double v0)
+    {
+        double v3 = v0 - ic2eq;
+        double v1 = a1 * ic1eq + a2 * v3;
+        double v2 = ic2eq + a2 * ic1eq + a3 * v3;
+
+        // Update integrator states (trapezoidal rule)
+        ic1eq = 2.0 * v1 - ic1eq;
+        ic2eq = 2.0 * v2 - ic2eq;
+
+        // Mix outputs: m0*input + m1*bandpass + m2*lowpass
+        return m0 * v0 + m1 * v1 + m2 * v2;
+    }
+
+    void reset()
+    {
+        ic1eq = 0.0;
+        ic2eq = 0.0;
+    }
+
+private:
+    double g, k, a1, a2, a3;  // filter coefficients
+    double m0, m1, m2;        // mix coefficients (select LP/HP/BP/Notch)
+    double ic1eq, ic2eq;      // integrator states
+};
+
+// ============================================================================
 // Partial — one sine oscillator + its own ADSR + level
 // ============================================================================
 
@@ -120,7 +199,7 @@ struct Partial
 };
 
 // ============================================================================
-// KawaiiVoice — 16 partials, each with independent ADSR
+// KawaiiVoice — 32 partials with independent ADSR + ZDF SVF filter
 // ============================================================================
 
 class KawaiiVoice
@@ -128,6 +207,9 @@ class KawaiiVoice
 public:
     KawaiiVoice()
         : noteNumber(-1), velocity(0.0), sampleRate(44100.0)
+        , filterCutoff(20000.0), filterReso(0.0)
+        , filterEnvDepth(0.0), filterKeytrack(0.0)
+        , filterType(kFilterLP)
     {}
 
     void setSampleRate(double sr)
@@ -135,6 +217,7 @@ public:
         sampleRate = sr;
         for (auto& p : partials)
             p.envelope.setSampleRate(sr);
+        filterEnvelope.setSampleRate(sr);
     }
 
     void noteOn(int note, double vel)
@@ -152,16 +235,22 @@ public:
             partials[i].phase = 0.0;
             partials[i].envelope.noteOn();
         }
+
+        // Start filter envelope on note-on
+        filterEnvelope.noteOn();
+        filter.reset();  // clean filter state for new note
     }
 
     void noteOff()
     {
         for (auto& p : partials)
             p.envelope.noteOff();
+        filterEnvelope.noteOff();
     }
 
     void process(double* outLeft, double* outRight)
     {
+        // 1. Sum all partials (each has its own level × ADSR)
         double sum = 0.0;
         for (auto& p : partials)
         {
@@ -170,6 +259,27 @@ public:
 
         // Scale by velocity; normalize by partial count to prevent clipping
         double sample = sum * velocity / static_cast<double>(kMaxPartials);
+
+        // 2. Apply ZDF SVF filter
+        //    Compute effective cutoff: base + envDepth × filterEnv + keytrack
+        double envValue = filterEnvelope.process();
+
+        // Env depth is bipolar: -1.0 to +1.0 (mapped from normalized 0–1 in processor)
+        // Modulates cutoff by up to ±10kHz
+        double envMod = filterEnvDepth * envValue * 10000.0;
+
+        // Keytrack: 0 = no tracking, 1 = full tracking (100 Hz per semitone from C3)
+        // C3 = MIDI 60 is the reference point
+        double keyMod = filterKeytrack * (noteNumber - 60) * 100.0;
+
+        double effectiveCutoff = std::clamp(filterCutoff + envMod + keyMod, 20.0, 20000.0);
+
+        // Map resonance (0–1) to Q (0.5–25). Higher Q = more resonant peak.
+        double Q = 0.5 + filterReso * 24.5;
+
+        filter.setCoefficients(sampleRate, effectiveCutoff, Q);
+        filter.setType(filterType);
+        sample = filter.processSample(sample);
 
         *outLeft  = sample;
         *outRight = sample;
@@ -185,6 +295,18 @@ public:
     int getNoteNumber() const { return noteNumber; }
     double getVelocity() const { return velocity; }
 
+    // --- Filter parameter setters (called by processor each block) ---
+    void setFilterCutoff(double hz)      { filterCutoff = hz; }
+    void setFilterResonance(double res)  { filterReso = res; }
+    void setFilterEnvDepth(double depth) { filterEnvDepth = depth; }
+    void setFilterKeytrack(double amt)   { filterKeytrack = amt; }
+    void setFilterType(FilterType type)  { filterType = type; }
+
+    void setFilterEnvAttack(double sec)  { filterEnvelope.setAttack(sec); }
+    void setFilterEnvDecay(double sec)   { filterEnvelope.setDecay(sec); }
+    void setFilterEnvSustain(double lvl) { filterEnvelope.setSustain(lvl); }
+    void setFilterEnvRelease(double sec) { filterEnvelope.setRelease(sec); }
+
     // Public so the processor can set per-partial ADSR and level directly
     std::array<Partial, kMaxPartials> partials;
 
@@ -192,6 +314,15 @@ private:
     int    noteNumber;
     double velocity;
     double sampleRate;
+
+    // Filter state (per-voice)
+    ZdfSvf filter;
+    ADSREnvelope filterEnvelope;
+    double filterCutoff;
+    double filterReso;
+    double filterEnvDepth;   // bipolar: -1.0 to +1.0
+    double filterKeytrack;   // 0.0 to 1.0
+    FilterType filterType;
 };
 
 } // namespace Kawaii
