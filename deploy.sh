@@ -23,9 +23,8 @@ echo ""
 if pgrep -xq "Live"; then
     echo "=== Quitting Ableton ==="
 
-    # Clean quit via Apple Event + Cmd+D ("Don't Save").
-    # The compiled Swift binary handles: terminate() → wait for dialog →
-    # activate → Cmd+D. Retries internally up to 5 times.
+    # Clean quit via Accessibility API.
+    # Handles: crash recovery dialog → "No", save dialog → "Don't Save".
     "${PROJECT_DIR}/scripts/quit_live"
 
     # Wait for exit
@@ -61,6 +60,10 @@ if [ -d "$ABLETON_APP" ]; then
         echo "  Project not found: $ABLETON_PROJECT"
         open "$ABLETON_APP"
     fi
+
+    # Dismiss crash recovery dialog if it appears on launch
+    echo "  Waiting for Ableton to load..."
+    "${PROJECT_DIR}/scripts/dismiss_recovery"
 else
     echo "Ableton not found at ${ABLETON_APP}"
 fi
