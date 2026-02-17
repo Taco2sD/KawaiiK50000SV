@@ -3,6 +3,7 @@
 #include "vstgui/vstgui.h"
 #include "vstgui/lib/controls/cknob.h"
 #include "vstgui/lib/controls/ctextlabel.h"
+#include "vstgui/lib/controls/coptionmenu.h"
 #include "vstgui/lib/cframe.h"
 
 namespace Steinberg {
@@ -11,11 +12,11 @@ namespace Kawaii {
 
 using namespace VSTGUI;
 
-// Layout constants — 4 groups of 8 partials + filter section
+// Layout constants — 4 groups of 8 partials + filter strip at bottom
 static constexpr int kWindowW = 1280;
-static constexpr int kWindowH = 560;
+static constexpr int kWindowH = 520;
 
-// Reduced knob sizes to fit 4 groups across
+// Partial knob sizes
 static constexpr int kKnobSize = 28;
 static constexpr int kLabelH = 11;
 static constexpr int kRowH = kKnobSize + kLabelH + 4;   // 43px per row
@@ -25,24 +26,24 @@ static constexpr int kRowLabelW = 28;
 // Vertical positions
 static constexpr int kTitleY = 8;
 static constexpr int kMasterY = 6;
-static constexpr int kGridTop = 72;
+static constexpr int kGridTop = 52;   // partials start closer to top
 
-// 4 groups of 8 partials across the window
+// 4 groups of 8 partials across
 static constexpr int kPartialsPerGroup = 8;
-static constexpr int kGroupGap = 12;   // gap between groups
-static constexpr int kGroupW = kRowLabelW + 5 * kColW;  // 28 + 280 = 308px
+static constexpr int kGroupGap = 12;
+static constexpr int kGroupW = kRowLabelW + 5 * kColW;  // 308px
 
-// Group horizontal positions (16 + 308 + 12 + 308 + 12 + 308 + 12 + 308 + 16 = 1300 ≈ 1280)
 static constexpr int kMarginLeft = 8;
 static constexpr int kGroup1Left = kMarginLeft;
 static constexpr int kGroup2Left = kGroup1Left + kGroupW + kGroupGap;
 static constexpr int kGroup3Left = kGroup2Left + kGroupW + kGroupGap;
 static constexpr int kGroup4Left = kGroup3Left + kGroupW + kGroupGap;
 
-// Filter section — in the header area, right side
+// Filter section — horizontal strip below the partial grid
+static constexpr int kGridBottom = kGridTop + kPartialsPerGroup * kRowH;  // 52 + 344 = 396
+static constexpr int kFilterY = kGridBottom + 14;  // 410
 static constexpr int kFilterKnobSize = 32;
 static constexpr int kFilterColW = 62;
-static constexpr int kFilterLabelH = 11;
 
 KawaiiEditor::KawaiiEditor(void* controller)
     : VSTGUIEditor(static_cast<EditController*>(controller))
@@ -98,8 +99,9 @@ void KawaiiEditor::createControls()
     CColor knobCorona(255, 140, 200, 255);   // pink arc
     CColor knobTrack(55, 55, 65, 255);       // dark arc track
     CColor knobDot(255, 180, 220, 255);      // pink dot handle
-    CColor filterCorona(100, 200, 255, 255); // blue arc for filter section
-    CColor filterDot(140, 220, 255, 255);    // blue dot handle for filter
+    CColor filterCorona(100, 200, 255, 255); // blue arc for filter
+    CColor filterDot(140, 220, 255, 255);    // blue dot for filter
+    CColor filterBg(38, 38, 48, 255);        // slightly lighter bg for filter strip
 
     // --- Helper: create a styled corona knob with label below ---
     auto makeKnob = [&](const char* name, ParamID tag, int x, int y,
@@ -135,12 +137,10 @@ void KawaiiEditor::createControls()
         frame->addView(label);
     };
 
-    // Shorthand for partial knobs (pink, small)
     auto partialKnob = [&](const char* name, ParamID tag, int x, int y) {
         makeKnob(name, tag, x, y, kKnobSize, knobCorona, knobDot);
     };
 
-    // Shorthand for filter knobs (blue, slightly larger)
     auto filterKnob = [&](const char* name, ParamID tag, int x, int y) {
         makeKnob(name, tag, x, y, kFilterKnobSize, filterCorona, filterDot);
     };
@@ -155,56 +155,20 @@ void KawaiiEditor::createControls()
     title->setHoriAlign(CHoriTxtAlign::kLeftText);
     frame->addView(title);
 
-    // --- Master knobs (upper left, after title) ---
+    // --- Master knobs (top area, after title) ---
     partialKnob("Volume", kParamMasterVolume, 180, kMasterY);
     partialKnob("Tune", kParamMasterTune, 250, kMasterY);
 
-    // --- Filter section (upper right area) ---
-    // Two rows of filter knobs: row 1 = Type, Cutoff, Reso, Depth, Key
-    //                           row 2 = Atk, Dec, Sus, Rel
-    {
-        int filterLeft = 770;
-        int filterRow1Y = kMasterY;
-        int filterRow2Y = kMasterY + kFilterKnobSize + kFilterLabelH + 6;
+    // ===================================================================
+    // PARTIALS GRID — 4 groups of 8
+    // ===================================================================
 
-        // Filter section label
-        CRect fltLabelRect(filterLeft - 4, kTitleY, filterLeft + 80, kTitleY + 16);
-        auto* fltLabel = new CTextLabel(fltLabelRect, "FILTER");
-        fltLabel->setFontColor(filterCorona);
-        fltLabel->setBackColor(CColor(0, 0, 0, 0));
-        fltLabel->setFrameColor(CColor(0, 0, 0, 0));
-        fltLabel->setFont(kNormalFontSmall);
-        fltLabel->setHoriAlign(CHoriTxtAlign::kLeftText);
-        frame->addView(fltLabel);
-
-        // Row 1: Type, Cutoff, Reso, Depth, Keytrk
-        filterKnob("Type",  kParamFilterType,    filterLeft,                  filterRow1Y);
-        filterKnob("Cutoff", kParamFilterCutoff,  filterLeft + kFilterColW,    filterRow1Y);
-        filterKnob("Reso",  kParamFilterReso,    filterLeft + kFilterColW * 2, filterRow1Y);
-        filterKnob("Depth", kParamFilterEnvDep,  filterLeft + kFilterColW * 3, filterRow1Y);
-        filterKnob("Key",   kParamFilterKeytrk,  filterLeft + kFilterColW * 4, filterRow1Y);
-
-        // Row 2: Filter envelope ADSR
-        filterKnob("F.Atk", kParamFilterEnvAtk,  filterLeft + kFilterColW * 0.5, filterRow2Y);
-        filterKnob("F.Dec", kParamFilterEnvDec,  filterLeft + kFilterColW * 1.5, filterRow2Y);
-        filterKnob("F.Sus", kParamFilterEnvSus,  filterLeft + kFilterColW * 2.5, filterRow2Y);
-        filterKnob("F.Rel", kParamFilterEnvRel,  filterLeft + kFilterColW * 3.5, filterRow2Y);
-    }
-
-    // --- Divider line between header and partials grid ---
-    CRect divRect(8, kGridTop - 8, kWindowW - 8, kGridTop - 7);
-    auto* divider = new CView(divRect);
-    divider->setBackground(nullptr);
-    frame->addView(divider);
-
-    // --- Column labels for partial knobs ---
     static const char* colLabels[] = {"Level", "Atk", "Dec", "Sus", "Rel"};
     static const int offsets[] = {
         kPartialOffLevel, kPartialOffAttack, kPartialOffDecay,
         kPartialOffSustain, kPartialOffRelease
     };
 
-    // --- Helper: create one group of 8 partials ---
     auto makeGroup = [&](int groupLeft, int startPartial, const char* groupTitle) {
         // Group title
         CRect grpRect(groupLeft, kGridTop - 12, groupLeft + kGroupW, kGridTop);
@@ -245,11 +209,90 @@ void KawaiiEditor::createControls()
         }
     };
 
-    // 4 groups of 8 partials
     makeGroup(kGroup1Left, 0,  "Partials 1-8");
     makeGroup(kGroup2Left, 8,  "Partials 9-16");
     makeGroup(kGroup3Left, 16, "Partials 17-24");
     makeGroup(kGroup4Left, 24, "Partials 25-32");
+
+    // ===================================================================
+    // FILTER SECTION — horizontal strip at the bottom
+    // ===================================================================
+
+    // Background strip for filter area
+    CRect filterStripRect(0, kFilterY - 8, kWindowW, kWindowH);
+    auto* filterStrip = new CView(filterStripRect);
+    filterStrip->setBackground(nullptr);
+    frame->addView(filterStrip);
+
+    // "FILTER" label
+    CRect fltTitleRect(16, kFilterY - 2, 100, kFilterY + 14);
+    auto* fltTitle = new CTextLabel(fltTitleRect, "FILTER");
+    fltTitle->setFontColor(filterCorona);
+    fltTitle->setBackColor(CColor(0, 0, 0, 0));
+    fltTitle->setFrameColor(CColor(0, 0, 0, 0));
+    fltTitle->setFont(kNormalFontSmall);
+    fltTitle->setHoriAlign(CHoriTxtAlign::kLeftText);
+    frame->addView(fltTitle);
+
+    // Filter type — dropdown selector (COptionMenu) showing LP/HP/BP/Notch
+    int typeX = 80;
+    CRect menuRect(typeX, kFilterY, typeX + 80, kFilterY + 22);
+    auto* typeMenu = new COptionMenu(menuRect, this, kParamFilterType);
+    typeMenu->addEntry("Low Pass");
+    typeMenu->addEntry("High Pass");
+    typeMenu->addEntry("Band Pass");
+    typeMenu->addEntry("Notch");
+    typeMenu->setFontColor(filterCorona);
+    typeMenu->setBackColor(CColor(45, 45, 55, 255));
+    typeMenu->setFrameColor(CColor(70, 70, 85, 255));
+    typeMenu->setFont(kNormalFontSmall);
+    // Initialize from controller
+    if (getController())
+    {
+        float normType = static_cast<float>(getController()->getParamNormalized(kParamFilterType));
+        int typeIndex = static_cast<int>(normType * 3 + 0.5f);
+        typeMenu->setCurrent(typeIndex);
+        typeMenu->setValue(normType);
+    }
+    frame->addView(typeMenu);
+
+    // "Type" label below menu
+    CRect typeLblRect(typeX, kFilterY + 24, typeX + 80, kFilterY + 24 + kLabelH);
+    auto* typeLbl = new CTextLabel(typeLblRect, "Type");
+    typeLbl->setFontColor(labelColor);
+    typeLbl->setBackColor(CColor(0, 0, 0, 0));
+    typeLbl->setFrameColor(CColor(0, 0, 0, 0));
+    typeLbl->setFont(kNormalFontVerySmall);
+    typeLbl->setHoriAlign(CHoriTxtAlign::kCenterText);
+    frame->addView(typeLbl);
+
+    // Filter knobs — all in one row after the type selector
+    int fKnobStart = 180;
+    int fKnobY = kFilterY - 4;
+
+    filterKnob("Cutoff",  kParamFilterCutoff,  fKnobStart,                    fKnobY);
+    filterKnob("Reso",    kParamFilterReso,    fKnobStart + kFilterColW,      fKnobY);
+    filterKnob("Depth",   kParamFilterEnvDep,  fKnobStart + kFilterColW * 2,  fKnobY);
+    filterKnob("Key",     kParamFilterKeytrk,  fKnobStart + kFilterColW * 3,  fKnobY);
+
+    // Gap, then filter envelope ADSR
+    int fEnvStart = fKnobStart + kFilterColW * 4 + 20;
+
+    // "Env" label before the ADSR knobs
+    CRect envLblRect(fEnvStart - 4, kFilterY - 2, fEnvStart + 30, kFilterY + 14);
+    auto* envLbl = new CTextLabel(envLblRect, "ENV");
+    envLbl->setFontColor(CColor(80, 170, 220, 255));
+    envLbl->setBackColor(CColor(0, 0, 0, 0));
+    envLbl->setFrameColor(CColor(0, 0, 0, 0));
+    envLbl->setFont(kNormalFontVerySmall);
+    envLbl->setHoriAlign(CHoriTxtAlign::kLeftText);
+    frame->addView(envLbl);
+
+    int fEnvKnobStart = fEnvStart + 32;
+    filterKnob("Atk",  kParamFilterEnvAtk,  fEnvKnobStart,                   fKnobY);
+    filterKnob("Dec",  kParamFilterEnvDec,  fEnvKnobStart + kFilterColW,     fKnobY);
+    filterKnob("Sus",  kParamFilterEnvSus,  fEnvKnobStart + kFilterColW * 2, fKnobY);
+    filterKnob("Rel",  kParamFilterEnvRel,  fEnvKnobStart + kFilterColW * 3, fKnobY);
 }
 
 } // namespace Kawaii

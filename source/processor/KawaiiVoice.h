@@ -87,6 +87,48 @@ private:
 };
 
 // ============================================================================
+// Parameter Smoother — one-pole exponential for click-free knob movement
+//
+// Without smoothing, filter cutoff/resonance jump at block boundaries
+// when the user moves a knob, causing audible stepping/clicks.
+// This interpolates toward the target value each sample (~5ms time constant).
+// ============================================================================
+
+class ParamSmoother
+{
+public:
+    ParamSmoother(double initial = 0.0)
+        : current(initial), target(initial), coeff(0.01)
+    {}
+
+    void setSampleRate(double sr)
+    {
+        // ~5ms smoothing time: coeff = 1 - e^(-2π / (time_in_samples))
+        // 5ms at sr=44100 ≈ 220.5 samples → coeff ≈ 0.028
+        double timeSamples = 0.005 * sr;
+        coeff = 1.0 - std::exp(-2.0 * M_PI / timeSamples);
+    }
+
+    void setTarget(double t) { target = t; }
+
+    double process()
+    {
+        current += (target - current) * coeff;
+        return current;
+    }
+
+    // Jump to target immediately (e.g. on note-on to avoid filter sweep artifacts)
+    void snap() { current = target; }
+
+    double getCurrent() const { return current; }
+
+private:
+    double current;
+    double target;
+    double coeff;
+};
+
+// ============================================================================
 // Cytomic ZDF State Variable Filter (2-pole, 12dB/oct)
 //
 // Topology-Preserving Transform (TPT) with trapezoidal integration.
@@ -207,7 +249,7 @@ class KawaiiVoice
 public:
     KawaiiVoice()
         : noteNumber(-1), velocity(0.0), sampleRate(44100.0)
-        , filterCutoff(20000.0), filterReso(0.0)
+        , cutoffSmoother(20000.0), resoSmoother(0.0)
         , filterEnvDepth(0.0), filterKeytrack(0.0)
         , filterType(kFilterLP)
     {}
@@ -218,6 +260,8 @@ public:
         for (auto& p : partials)
             p.envelope.setSampleRate(sr);
         filterEnvelope.setSampleRate(sr);
+        cutoffSmoother.setSampleRate(sr);
+        resoSmoother.setSampleRate(sr);
     }
 
     void noteOn(int note, double vel)
@@ -239,6 +283,8 @@ public:
         // Start filter envelope on note-on
         filterEnvelope.noteOn();
         filter.reset();  // clean filter state for new note
+        cutoffSmoother.snap();  // no sweep artifact on new note
+        resoSmoother.snap();
     }
 
     void noteOff()
@@ -260,22 +306,23 @@ public:
         // Scale by velocity; normalize by partial count to prevent clipping
         double sample = sum * velocity / static_cast<double>(kMaxPartials);
 
-        // 2. Apply ZDF SVF filter
-        //    Compute effective cutoff: base + envDepth × filterEnv + keytrack
+        // 2. Apply ZDF SVF filter with per-sample smoothed parameters
         double envValue = filterEnvelope.process();
 
-        // Env depth is bipolar: -1.0 to +1.0 (mapped from normalized 0–1 in processor)
-        // Modulates cutoff by up to ±10kHz
+        // Smooth cutoff and reso to avoid stepping when user moves knobs
+        double smoothedCutoff = cutoffSmoother.process();
+        double smoothedReso   = resoSmoother.process();
+
+        // Env depth is bipolar: -1.0 to +1.0 — modulates cutoff by up to ±10kHz
         double envMod = filterEnvDepth * envValue * 10000.0;
 
-        // Keytrack: 0 = no tracking, 1 = full tracking (100 Hz per semitone from C3)
-        // C3 = MIDI 60 is the reference point
+        // Keytrack: 0 = no tracking, 1 = full (100 Hz/semitone from C3 = MIDI 60)
         double keyMod = filterKeytrack * (noteNumber - 60) * 100.0;
 
-        double effectiveCutoff = std::clamp(filterCutoff + envMod + keyMod, 20.0, 20000.0);
+        double effectiveCutoff = std::clamp(smoothedCutoff + envMod + keyMod, 20.0, 20000.0);
 
-        // Map resonance (0–1) to Q (0.5–25). Higher Q = more resonant peak.
-        double Q = 0.5 + filterReso * 24.5;
+        // Map smoothed resonance (0–1) to Q (0.5–25)
+        double Q = 0.5 + smoothedReso * 24.5;
 
         filter.setCoefficients(sampleRate, effectiveCutoff, Q);
         filter.setType(filterType);
@@ -296,8 +343,9 @@ public:
     double getVelocity() const { return velocity; }
 
     // --- Filter parameter setters (called by processor each block) ---
-    void setFilterCutoff(double hz)      { filterCutoff = hz; }
-    void setFilterResonance(double res)  { filterReso = res; }
+    // Cutoff and reso go through smoothers for click-free knob movement
+    void setFilterCutoff(double hz)      { cutoffSmoother.setTarget(hz); }
+    void setFilterResonance(double res)  { resoSmoother.setTarget(res); }
     void setFilterEnvDepth(double depth) { filterEnvDepth = depth; }
     void setFilterKeytrack(double amt)   { filterKeytrack = amt; }
     void setFilterType(FilterType type)  { filterType = type; }
@@ -318,10 +366,10 @@ private:
     // Filter state (per-voice)
     ZdfSvf filter;
     ADSREnvelope filterEnvelope;
-    double filterCutoff;
-    double filterReso;
-    double filterEnvDepth;   // bipolar: -1.0 to +1.0
-    double filterKeytrack;   // 0.0 to 1.0
+    ParamSmoother cutoffSmoother;   // smoothed cutoff in Hz
+    ParamSmoother resoSmoother;     // smoothed resonance 0–1
+    double filterEnvDepth;          // bipolar: -1.0 to +1.0
+    double filterKeytrack;          // 0.0 to 1.0
     FilterType filterType;
 };
 
