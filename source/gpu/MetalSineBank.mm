@@ -83,6 +83,7 @@ struct MetalSineBank::Impl {
     int maxOscillators = 0;
     int maxBlockSize   = 0;
     bool available     = false;
+    uint64_t dispatchCount = 0;
 };
 
 // ============================================================================
@@ -146,6 +147,14 @@ bool MetalSineBank::init(int maxOscillators, int maxBlockSize)
             return false;
 
         _impl->available = true;
+
+        NSLog(@"[KawaiiGPU] Metal init OK — device: %@, maxThreads: %lu, "
+              "oscBuf: %luB, envBuf: %luB, outBuf: %luB",
+              _impl->device.name,
+              (unsigned long)_impl->pipeline.maxTotalThreadsPerThreadgroup,
+              (unsigned long)_impl->oscParamsBuf.length,
+              (unsigned long)_impl->envValuesBuf.length,
+              (unsigned long)_impl->outputBuf.length);
     }
     return true;
 }
@@ -195,6 +204,13 @@ void MetalSineBank::processBlock(
 
         // Read result from shared memory
         memcpy(output, _impl->outputBuf.contents, (size_t)numSamples * sizeof(float));
+
+        _impl->dispatchCount++;
+        // Log first dispatch and every 10000th thereafter
+        if (_impl->dispatchCount == 1 || _impl->dispatchCount % 10000 == 0) {
+            NSLog(@"[KawaiiGPU] dispatch #%llu — %d oscillators × %d samples on GPU",
+                  _impl->dispatchCount, numOscillators, numSamples);
+        }
     }
 }
 
