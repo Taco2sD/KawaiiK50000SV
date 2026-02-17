@@ -74,16 +74,6 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
             ParameterInfo::kCanAutomate, partialParam(i, kPartialOffRelease), 0, STR16("Partials"));
     }
 
-    // 4 dummies: 66 total params, max ID 65
-    parameters.addParameter(STR16("Dummy A"), STR16("%"), 0, 0.5,
-        ParameterInfo::kCanAutomate, 62, 0, STR16("Test"));
-    parameters.addParameter(STR16("Dummy B"), STR16("%"), 0, 0.5,
-        ParameterInfo::kCanAutomate, 63, 0, STR16("Test"));
-    parameters.addParameter(STR16("Dummy C"), STR16("%"), 0, 0.5,
-        ParameterInfo::kCanAutomate, 64, 0, STR16("Test"));
-    parameters.addParameter(STR16("Dummy D"), STR16("%"), 0, 0.5,
-        ParameterInfo::kCanAutomate, 65, 0, STR16("Test"));
-
     return kResultOk;
 }
 
