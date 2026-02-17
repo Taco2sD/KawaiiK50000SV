@@ -1,11 +1,12 @@
 /**
  * KawaiiProcessor.cpp — K50V: 32-partial additive synth with ZDF SVF filter
  *
- * Hybrid GPU+CPU pipeline:
+ * Async double-buffered GPU+CPU pipeline:
  *   Phase 1 (CPU): Pre-compute per-partial ADSR envelopes, build VoiceDescriptors
- *   Phase 2 (GPU): Metal compute — sin() × level × env per-voice summation
- *   Phase 3 (CPU): Per-voice ZDF SVF filter + mix to stereo output
+ *   Phase 2 (GPU): Submit to Metal (non-blocking), retrieve PREVIOUS block's results
+ *   Phase 3 (CPU): Per-voice ZDF SVF filter on previous results + mix to stereo
  *
+ * The audio thread never blocks on GPU. One buffer of latency, DAW-compensated via PDC.
  * Falls back to pure CPU path if Metal is unavailable.
  */
 
@@ -121,6 +122,15 @@ tresult PLUGIN_API KawaiiProcessor::canProcessSampleSize(int32 symbolicSampleSiz
     return kResultFalse;
 }
 
+uint32 PLUGIN_API KawaiiProcessor::getLatencySamples()
+{
+    // Async double buffering adds one buffer of latency when GPU is active.
+    // The DAW uses this to shift other tracks forward (plugin delay compensation).
+    if (useGPU)
+        return static_cast<uint32>(metalSineBank.getLatencySamples());
+    return 0;
+}
+
 void KawaiiProcessor::updateParameters()
 {
     using namespace ParamRanges;
@@ -221,24 +231,30 @@ void KawaiiProcessor::processEvent(const Event& event)
 }
 
 // ============================================================================
-// Hybrid GPU+CPU render path
+// Async double-buffered GPU+CPU render path
 //
-// Phase 1 (CPU): Collect oscillator params grouped by voice, pre-compute
-//                ADSR envelopes per-sample, build VoiceDescriptors.
-// Phase 2 (GPU): Metal compute — parallel sin() + per-voice summation.
-// Phase 3 (CPU): Read per-voice GPU output, apply ZDF SVF filter per-voice,
-//                mix filtered voices to stereo output.
+// The audio thread NEVER blocks on GPU completion. Instead:
+//   Phase 1: Prepare current block's GPU data (ADSR pre-computation)
+//   Phase 2: Submit current block to GPU (non-blocking) + retrieve previous results
+//   Phase 3: Apply CPU-side ZDF SVF filter to PREVIOUS block's GPU output
+//
+// One buffer of latency, compensated by DAW via getLatencySamples().
 // ============================================================================
 
 void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)
 {
     double sr = processSetup.sampleRate;
-    int numOsc = 0;       // Total oscillators across all active voices
-    int numVoices = 0;    // Number of active voices sent to GPU
 
     // =========================================================================
-    // Phase 1: CPU — Collect oscillators grouped by voice, pre-compute ADSR
+    // Phase 1: CPU — Prepare current block for GPU dispatch
+    //
+    // Collect oscillators grouped by voice, pre-compute per-sample ADSR
+    // envelopes, build VoiceDescriptors, record voice mapping.
     // =========================================================================
+
+    int numOsc = 0;
+    int numVoices = 0;
+    std::array<int, kMaxVoices> currentVoiceMap;
 
     for (int v = 0; v < kMaxVoices; v++)
     {
@@ -252,7 +268,6 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
             auto& partial = voice.partials[p];
             if (!partial.envelope.isActive()) continue;
 
-            // Pack oscillator params (velocityScale unused by per-voice kernel)
             gpuOscParams[(size_t)numOsc] = {
                 static_cast<float>(partial.phase),
                 static_cast<float>(partial.frequency / sr),
@@ -268,29 +283,32 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
 
             // Advance phase on CPU (double precision for accuracy)
             partial.phase += numSamples * (partial.frequency / sr);
-            partial.phase -= static_cast<int>(partial.phase);  // wrap to [0, 1)
+            partial.phase -= static_cast<int>(partial.phase);
 
             numOsc++;
         }
 
-        // Build voice descriptor for GPU
         gpuVoiceDescs[(size_t)numVoices] = {
             static_cast<uint32_t>(voiceStartOsc),
             static_cast<uint32_t>(numOsc - voiceStartOsc),
             static_cast<float>(voice.getVelocity() / static_cast<double>(kMaxPartials)),
-            0.0f  // padding
+            0.0f
         };
+
+        // Record which voices[] index maps to this GPU voice index
+        currentVoiceMap[(size_t)numVoices] = v;
         numVoices++;
     }
 
-    if (numVoices == 0) return;
-
     // =========================================================================
-    // Phase 2: GPU — Parallel sin() computation + per-voice summation
+    // Phase 2: Submit current block to GPU + retrieve previous block's results
     //
-    // Each GPU thread handles one (voice, sample) pair.
-    // Output: gpuPerVoiceOutput[voiceIdx * numSamples + sampleIdx]
+    // processBlock is NON-BLOCKING: it commits the current block's command
+    // buffer and immediately returns the PREVIOUS block's GPU output.
     // =========================================================================
+
+    int prevNumVoices = 0;
+    int prevNumSamples = 0;
 
     metalSineBank.processBlock(
         gpuOscParams.data(),
@@ -298,62 +316,65 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
         numOsc,
         gpuVoiceDescs.data(),
         numVoices,
+        numSamples,
         gpuPerVoiceOutput.data(),
-        numSamples
+        prevNumVoices,
+        prevNumSamples
     );
 
     // =========================================================================
-    // Phase 3: CPU — Per-voice ZDF SVF filter + mix to stereo
+    // Phase 3: CPU — Filter PREVIOUS block's GPU output + mix to stereo
     //
-    // Each voice's GPU output is a pre-summed mono stream (sin × level × env
-    // × velocityScale). We apply the same filter chain as KawaiiVoice::process()
-    // but reading from the GPU buffer instead of computing sin() on CPU.
+    // Uses prevGpuVoiceMap (saved from the PREVIOUS call) to know which
+    // voice[] entry each GPU voice index corresponds to.
     // =========================================================================
 
-    int gpuVoiceIdx = 0;
-    for (int v = 0; v < kMaxVoices; v++)
+    if (prevNumVoices > 0 && prevNumSamples > 0)
     {
-        auto& voice = voices[v];
-        if (!voice.isActive()) continue;
-
-        float* voiceBuf = &gpuPerVoiceOutput[(size_t)(gpuVoiceIdx * numSamples)];
-
-        for (int32 s = 0; s < numSamples; s++)
+        for (int i = 0; i < prevNumVoices; i++)
         {
-            double sample = static_cast<double>(voiceBuf[s]);
+            int vIdx = prevGpuVoiceMap[(size_t)i];
+            auto& voice = voices[vIdx];
 
-            // Advance filter state per-sample (same logic as KawaiiVoice::process)
-            double envValue    = voice.processFilterEnvelope();
-            double smoothedNorm = voice.processFilterCutoffSmooth();
-            double smoothedReso = voice.processFilterResoSmooth();
+            float* voiceBuf = &gpuPerVoiceOutput[(size_t)(i * prevNumSamples)];
 
-            // Convert smoothed normalized cutoff to Hz (exponential mapping)
-            // 20 * 1000^norm: norm=0 → 20 Hz, norm=0.5 → 632 Hz, norm=1 → 20 kHz
-            double baseCutoffHz = 20.0 * std::pow(1000.0, smoothedNorm);
+            for (int32 s = 0; s < prevNumSamples && s < numSamples; s++)
+            {
+                double sample = static_cast<double>(voiceBuf[s]);
 
-            // Env depth is bipolar: -1 to +1 — modulates cutoff by up to ±10kHz
-            double envMod = voice.getFilterEnvDepth() * envValue * 10000.0;
+                // Advance filter state per-sample
+                double envValue     = voice.processFilterEnvelope();
+                double smoothedNorm = voice.processFilterCutoffSmooth();
+                double smoothedReso = voice.processFilterResoSmooth();
 
-            // Keytrack: 0 = no tracking, 1 = full (100 Hz/semitone from C3 = MIDI 60)
-            double keyMod = voice.getFilterKeytrack() * (voice.getNoteNumber() - 60) * 100.0;
+                // Convert smoothed normalized cutoff to Hz (exponential mapping)
+                double baseCutoffHz = 20.0 * std::pow(1000.0, smoothedNorm);
 
-            double effectiveCutoff = std::clamp(baseCutoffHz + envMod + keyMod, 20.0, 20000.0);
-            double Q = 0.5 + smoothedReso * 24.5;
+                // Bipolar env depth: -1 to +1 → modulates cutoff ±10kHz
+                double envMod = voice.getFilterEnvDepth() * envValue * 10000.0;
 
-            sample = voice.applyFilter(sample, effectiveCutoff, Q);
+                // Keytrack: 0 = none, 1 = full (100 Hz/semitone from C3)
+                double keyMod = voice.getFilterKeytrack() * (voice.getNoteNumber() - 60) * 100.0;
 
-            // Mix into stereo output
-            for (int32 ch = 0; ch < numChannels; ch++)
-                outputs[ch][s] += static_cast<float>(sample * masterVol);
+                double effectiveCutoff = std::clamp(baseCutoffHz + envMod + keyMod, 20.0, 20000.0);
+                double Q = 0.5 + smoothedReso * 24.5;
+
+                sample = voice.applyFilter(sample, effectiveCutoff, Q);
+
+                for (int32 ch = 0; ch < numChannels; ch++)
+                    outputs[ch][s] += static_cast<float>(sample * masterVol);
+            }
         }
 
-        gpuVoiceIdx++;
+        // Clamp
+        for (int32 ch = 0; ch < numChannels; ch++)
+            for (int32 s = 0; s < numSamples; s++)
+                outputs[ch][s] = std::clamp(outputs[ch][s], -1.0f, 1.0f);
     }
 
-    // Clamp final output
-    for (int32 ch = 0; ch < numChannels; ch++)
-        for (int32 s = 0; s < numSamples; s++)
-            outputs[ch][s] = std::clamp(outputs[ch][s], -1.0f, 1.0f);
+    // Save current voice mapping for the NEXT call's Phase 3
+    prevGpuVoiceMap = currentVoiceMap;
+    prevGpuNumVoices = numVoices;
 }
 
 // ============================================================================

@@ -1,7 +1,9 @@
 /**
  * KawaiiProcessor.h — VST3 Audio Processor
  *
- * Stripped to bare minimum to match VulcanSynth's proven working pattern.
+ * Hybrid GPU+CPU pipeline with async double buffering.
+ * GPU computes per-voice sin+sum (non-blocking), CPU applies per-voice filter.
+ * One buffer of latency reported to DAW for PDC.
  */
 
 #pragma once
@@ -35,6 +37,9 @@ public:
     tresult PLUGIN_API setState(IBStream* state) override;
     tresult PLUGIN_API getState(IBStream* state) override;
 
+    // Report latency from async double buffering so DAW can compensate
+    uint32 PLUGIN_API getLatencySamples() override;
+
 private:
     void updateParameters();
     void processEvent(const Steinberg::Vst::Event& event);
@@ -44,13 +49,19 @@ private:
     std::array<KawaiiVoice, kMaxVoices> voices;
     std::array<ParamValue, kNumParams> params;
 
-    // GPU synthesis — hybrid pipeline (GPU sin+sum per-voice, CPU filter per-voice)
+    // GPU synthesis — async double-buffered hybrid pipeline
     MetalSineBank metalSineBank;
     bool useGPU = false;
     std::vector<OscillatorParams> gpuOscParams;
     std::vector<float> gpuEnvValues;
-    std::vector<VoiceDescriptor> gpuVoiceDescs;      // per-voice oscillator ranges
-    std::vector<float> gpuPerVoiceOutput;            // [voiceIdx * maxBlock + sample]
+    std::vector<VoiceDescriptor> gpuVoiceDescs;
+    std::vector<float> gpuPerVoiceOutput;  // receives PREVIOUS block's GPU results
+
+    // Voice mapping for the PREVIOUS GPU dispatch.
+    // Needed so Phase 3 (filter) knows which voice[] entry each GPU voice index
+    // corresponds to, even if voice activity changed since the dispatch.
+    std::array<int, kMaxVoices> prevGpuVoiceMap;  // prevGpuVoiceMap[gpuIdx] = voices[] index
+    int prevGpuNumVoices = 0;
 };
 
 } // namespace Kawaii

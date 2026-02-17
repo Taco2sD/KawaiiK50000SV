@@ -1,17 +1,25 @@
 /**
- * MetalSineBank.mm — Metal compute for per-voice additive synthesis
+ * MetalSineBank.mm — Async double-buffered Metal compute for additive synthesis
  *
- * Hybrid GPU+CPU architecture:
- *   - One GPU thread per (voice, sample) pair
- *   - Each thread sums only its voice's oscillators → per-voice output
- *   - CPU applies per-voice ZDF SVF filter after GPU dispatch
+ * Key change from sync version: the audio thread NEVER blocks on GPU completion.
  *
- * Threading model (one thread per voice×sample) scales well for moderate
- * oscillator counts. When scaling to 2048+ partials per voice, restructure
- * to one-thread-per-oscillator + parallel reduction.
+ * Double-buffer protocol:
+ *   processBlock() submits block N to GPU (non-blocking) and returns block N-1's
+ *   results (already completed by GPU). The audio thread is free to apply CPU-side
+ *   ZDF SVF filtering to the previous results without waiting.
  *
- * Shared memory buffers (MTLResourceStorageModeShared) — zero-copy on Apple Silicon.
- * Synchronous dispatch (waitUntilCompleted) — sub-millisecond for current workload.
+ * Two buffer sets (A and B) ping-pong:
+ *   Block 0: submit to A, return silence (no previous)
+ *   Block 1: submit to B, return A's results (GPU finished during block 0→1)
+ *   Block 2: submit to A, return B's results
+ *   ...
+ *
+ * Completion handler (Metal background thread) sets an atomic flag when GPU finishes.
+ * If GPU hasn't finished by the time we need the result (shouldn't happen at normal
+ * buffer sizes), we gracefully output silence rather than blocking.
+ *
+ * Cost: one buffer of latency (~11.6ms at 512 samples / 44.1kHz).
+ * The DAW compensates via plugin delay compensation (PDC).
  */
 
 #ifdef __APPLE__
@@ -22,6 +30,7 @@
 #import <Foundation/Foundation.h>
 
 #include <cstring>
+#include <atomic>
 
 namespace Steinberg {
 namespace Vst {
@@ -29,10 +38,7 @@ namespace Kawaii {
 
 // ============================================================================
 // Metal Shader Source — Per-Voice Additive Synthesis Kernel
-//
-// Thread mapping: globalThreadId = voiceIdx * numSamples + sampleIdx
-// Each thread reads its VoiceDescriptor to find which oscillators belong
-// to its voice, sums them, and writes to per-voice output buffer.
+// (unchanged from sync version — the GPU work itself is identical)
 // ============================================================================
 
 static const char* kSineBankShaderSource = R"metal(
@@ -43,15 +49,14 @@ struct OscillatorParams {
     float phaseStart;
     float phaseIncrement;
     float level;
-    float velocityScale;   // unused by per-voice kernel (handled by VoiceDescriptor)
+    float velocityScale;
 };
 
-// Tells each GPU thread which oscillators belong to its voice
 struct VoiceDescriptor {
-    uint startOsc;          // First oscillator index for this voice
-    uint numOsc;            // Number of active oscillators for this voice
-    float velocityScale;    // velocity / kMaxPartials (applied once after sum)
-    float pad;              // 16-byte alignment
+    uint startOsc;
+    uint numOsc;
+    float velocityScale;
+    float pad;
 };
 
 // One thread per (voice, sample) pair.
@@ -65,53 +70,69 @@ kernel void sineBankPerVoiceKernel(
     constant uint& numSamples                [[buffer(5)]],
     uint globalThreadId [[thread_position_in_grid]])
 {
-    // Decode which voice and which sample this thread handles
     uint voiceIdx  = globalThreadId / numSamples;
     uint sampleIdx = globalThreadId % numSamples;
-
-    // Bounds check — thread grid may be padded beyond actual work
     if (voiceIdx >= numVoices || sampleIdx >= numSamples) return;
 
-    // Read this voice's descriptor
     VoiceDescriptor desc = voiceDescs[voiceIdx];
 
-    // Sum this voice's oscillators at this sample position
     float sum = 0.0f;
     for (uint i = 0; i < desc.numOsc; i++) {
         uint oscIdx = desc.startOsc + i;
         float env = envValues[oscIdx * numSamples + sampleIdx];
-        if (env <= 0.0f) continue;  // skip silent partials
+        if (env <= 0.0f) continue;
 
-        // Compute exact phase at this sample position (no sequential dependency)
         float phase = oscParams[oscIdx].phaseStart
                     + float(sampleIdx) * oscParams[oscIdx].phaseIncrement;
-        phase = phase - floor(phase);   // wrap to [0, 1)
+        phase = phase - floor(phase);
 
         sum += metal::sin(2.0f * M_PI_F * phase)
              * oscParams[oscIdx].level
              * env;
     }
 
-    // Apply velocity scaling (same for all partials in this voice)
     sum *= desc.velocityScale;
-
-    // Write to per-voice output: [voiceIdx * numSamples + sampleIdx]
     output[voiceIdx * numSamples + sampleIdx] = sum;
 }
 )metal";
 
 // ============================================================================
-// PIMPL — hides ObjC types from C++ headers
+// PIMPL — double-buffered Metal state
 // ============================================================================
 
+// One complete set of GPU input/output buffers.
+// Two of these ping-pong for async double buffering.
+struct BufferSet {
+    id<MTLBuffer> oscParamsBuf = nil;
+    id<MTLBuffer> envValuesBuf = nil;
+    id<MTLBuffer> outputBuf    = nil;
+    id<MTLBuffer> voiceDescsBuf = nil;
+
+    // Set true by Metal completion handler when GPU finishes this set.
+    // Cleared by processBlock before submitting new work to this set.
+    std::atomic<bool> gpuDone{false};
+
+    // Dimensions of the dispatch stored in this set (needed to read back results)
+    int numVoices  = 0;
+    int numSamples = 0;
+};
+
 struct MetalSineBank::Impl {
-    id<MTLDevice>               device          = nil;
-    id<MTLCommandQueue>         commandQueue    = nil;
-    id<MTLComputePipelineState> pipeline        = nil;
-    id<MTLBuffer>               oscParamsBuf    = nil;
-    id<MTLBuffer>               envValuesBuf    = nil;
-    id<MTLBuffer>               outputBuf       = nil;  // per-voice: maxVoices * maxBlockSize
-    id<MTLBuffer>               voiceDescsBuf   = nil;  // voice descriptors
+    id<MTLDevice>               device       = nil;
+    id<MTLCommandQueue>         commandQueue = nil;
+    id<MTLComputePipelineState> pipeline     = nil;
+
+    // Double buffer: two complete buffer sets
+    BufferSet sets[2];
+
+    // Index of the set to WRITE to next.
+    // The "previous" result is in sets[1 - nextWriteIdx].
+    int nextWriteIdx = 0;
+
+    // False until the first dispatch has been submitted.
+    // Before that, there's no previous result to retrieve.
+    bool hasPreviousResult = false;
+
     int maxOscillators = 0;
     int maxBlockSize   = 0;
     int maxVoices      = 0;
@@ -141,7 +162,6 @@ bool MetalSineBank::init(int maxOscillators, int maxBlockSize, int maxVoices)
         _impl->device = MTLCreateSystemDefaultDevice();
         if (!_impl->device) return false;
 
-        // Compile shader from source at runtime (avoids .metallib build step)
         NSError* error = nil;
         NSString* source = [NSString stringWithUTF8String:kSineBankShaderSource];
         id<MTLLibrary> library = [_impl->device newLibraryWithSource:source
@@ -162,42 +182,47 @@ bool MetalSineBank::init(int maxOscillators, int maxBlockSize, int maxVoices)
         _impl->commandQueue = [_impl->device newCommandQueue];
         if (!_impl->commandQueue) return false;
 
-        // Shared memory buffers — CPU and GPU access the same physical memory
-        // on Apple Silicon (zero-copy). On Intel Macs, the driver handles transfers.
+        // Allocate TWO complete buffer sets for double buffering.
+        // While GPU processes set A, CPU reads from set B (previous result).
         MTLResourceOptions opts = MTLResourceStorageModeShared;
 
-        _impl->oscParamsBuf = [_impl->device
-            newBufferWithLength:(NSUInteger)(maxOscillators * sizeof(OscillatorParams))
-                        options:opts];
+        for (int i = 0; i < 2; i++)
+        {
+            auto& set = _impl->sets[i];
 
-        _impl->envValuesBuf = [_impl->device
-            newBufferWithLength:(NSUInteger)(maxOscillators * maxBlockSize * sizeof(float))
-                        options:opts];
+            set.oscParamsBuf = [_impl->device
+                newBufferWithLength:(NSUInteger)(maxOscillators * sizeof(OscillatorParams))
+                            options:opts];
 
-        // Per-voice output: one mono stream per voice (was: single mono stream)
-        _impl->outputBuf = [_impl->device
-            newBufferWithLength:(NSUInteger)(maxVoices * maxBlockSize * sizeof(float))
-                        options:opts];
+            set.envValuesBuf = [_impl->device
+                newBufferWithLength:(NSUInteger)(maxOscillators * maxBlockSize * sizeof(float))
+                            options:opts];
 
-        // Voice descriptors: one per voice
-        _impl->voiceDescsBuf = [_impl->device
-            newBufferWithLength:(NSUInteger)(maxVoices * sizeof(VoiceDescriptor))
-                        options:opts];
+            set.outputBuf = [_impl->device
+                newBufferWithLength:(NSUInteger)(maxVoices * maxBlockSize * sizeof(float))
+                            options:opts];
 
-        if (!_impl->oscParamsBuf || !_impl->envValuesBuf ||
-            !_impl->outputBuf || !_impl->voiceDescsBuf)
-            return false;
+            set.voiceDescsBuf = [_impl->device
+                newBufferWithLength:(NSUInteger)(maxVoices * sizeof(VoiceDescriptor))
+                            options:opts];
 
+            if (!set.oscParamsBuf || !set.envValuesBuf ||
+                !set.outputBuf || !set.voiceDescsBuf)
+                return false;
+
+            set.gpuDone.store(false);
+            set.numVoices = 0;
+            set.numSamples = 0;
+        }
+
+        _impl->nextWriteIdx = 0;
+        _impl->hasPreviousResult = false;
         _impl->available = true;
 
-        NSLog(@"[KawaiiGPU] Metal init OK — device: %@, maxThreads: %lu, "
-              "oscBuf: %luB, envBuf: %luB, outBuf: %luB (per-voice: %d voices)",
+        NSLog(@"[KawaiiGPU] Metal init OK (async double-buffer) — device: %@, "
+              "maxThreads: %lu, 2× buffers allocated",
               _impl->device.name,
-              (unsigned long)_impl->pipeline.maxTotalThreadsPerThreadgroup,
-              (unsigned long)_impl->oscParamsBuf.length,
-              (unsigned long)_impl->envValuesBuf.length,
-              (unsigned long)_impl->outputBuf.length,
-              maxVoices);
+              (unsigned long)_impl->pipeline.maxTotalThreadsPerThreadgroup);
     }
     return true;
 }
@@ -208,21 +233,86 @@ void MetalSineBank::processBlock(
     int numOscillators,
     const VoiceDescriptor* voiceDescs,
     int numVoices,
-    float* output,
-    int numSamples)
+    int numSamples,
+    float* prevOutput,
+    int& outPrevNumVoices,
+    int& outPrevNumSamples)
 {
-    if (!_impl->available || numVoices == 0 || numSamples == 0) {
-        memset(output, 0, (size_t)(numVoices * numSamples) * sizeof(float));
+    outPrevNumVoices  = 0;
+    outPrevNumSamples = 0;
+
+    if (!_impl->available) return;
+
+    // =========================================================================
+    // Step 1: Retrieve PREVIOUS block's GPU results (if available)
+    //
+    // The previous dispatch is in sets[1 - nextWriteIdx]. If the GPU has
+    // finished (gpuDone == true), copy the results out. If not (shouldn't
+    // happen at normal buffer sizes), output silence — never block.
+    // =========================================================================
+
+    if (_impl->hasPreviousResult)
+    {
+        int readIdx = 1 - _impl->nextWriteIdx;
+        auto& readSet = _impl->sets[readIdx];
+
+        if (readSet.gpuDone.load(std::memory_order_acquire))
+        {
+            outPrevNumVoices  = readSet.numVoices;
+            outPrevNumSamples = readSet.numSamples;
+
+            if (outPrevNumVoices > 0 && outPrevNumSamples > 0)
+            {
+                // Read directly from shared memory (zero-copy on Apple Silicon)
+                memcpy(prevOutput, readSet.outputBuf.contents,
+                       (size_t)(outPrevNumVoices * outPrevNumSamples) * sizeof(float));
+            }
+        }
+        else
+        {
+            // GPU not done yet — graceful degradation: output silence.
+            // This should rarely happen; log it for diagnostics.
+            NSLog(@"[KawaiiGPU] WARNING: GPU not finished for previous block "
+                  "(dispatch #%llu) — outputting silence",
+                  _impl->dispatchCount);
+        }
+    }
+
+    // =========================================================================
+    // Step 2: Submit CURRENT block to GPU (non-blocking)
+    //
+    // Write data into the next buffer set, encode command buffer, commit with
+    // a completion handler that sets gpuDone. The audio thread returns
+    // immediately after commit — no waitUntilCompleted!
+    // =========================================================================
+
+    if (numVoices == 0 || numSamples == 0)
+    {
+        // Nothing to dispatch. Mark this slot as done with zero output.
+        auto& writeSet = _impl->sets[_impl->nextWriteIdx];
+        writeSet.numVoices = 0;
+        writeSet.numSamples = 0;
+        writeSet.gpuDone.store(true, std::memory_order_release);
+        _impl->hasPreviousResult = true;
+        _impl->nextWriteIdx = 1 - _impl->nextWriteIdx;
         return;
     }
 
     @autoreleasepool {
-        // Write into shared Metal buffers (zero-copy on Apple Silicon)
-        memcpy(_impl->oscParamsBuf.contents, oscParams,
+        int writeIdx = _impl->nextWriteIdx;
+        auto& writeSet = _impl->sets[writeIdx];
+
+        // Mark as not done (GPU hasn't started yet)
+        writeSet.gpuDone.store(false, std::memory_order_release);
+        writeSet.numVoices  = numVoices;
+        writeSet.numSamples = numSamples;
+
+        // Write data into this set's shared Metal buffers
+        memcpy(writeSet.oscParamsBuf.contents, oscParams,
                (size_t)numOscillators * sizeof(OscillatorParams));
-        memcpy(_impl->envValuesBuf.contents, envValues,
+        memcpy(writeSet.envValuesBuf.contents, envValues,
                (size_t)numOscillators * numSamples * sizeof(float));
-        memcpy(_impl->voiceDescsBuf.contents, voiceDescs,
+        memcpy(writeSet.voiceDescsBuf.contents, voiceDescs,
                (size_t)numVoices * sizeof(VoiceDescriptor));
 
         // Encode compute command
@@ -230,18 +320,16 @@ void MetalSineBank::processBlock(
         id<MTLComputeCommandEncoder> enc = [cmdBuf computeCommandEncoder];
 
         [enc setComputePipelineState:_impl->pipeline];
-        [enc setBuffer:_impl->oscParamsBuf   offset:0 atIndex:0];
-        [enc setBuffer:_impl->envValuesBuf   offset:0 atIndex:1];
-        [enc setBuffer:_impl->outputBuf      offset:0 atIndex:2];
-        [enc setBuffer:_impl->voiceDescsBuf  offset:0 atIndex:3];
+        [enc setBuffer:writeSet.oscParamsBuf   offset:0 atIndex:0];
+        [enc setBuffer:writeSet.envValuesBuf   offset:0 atIndex:1];
+        [enc setBuffer:writeSet.outputBuf      offset:0 atIndex:2];
+        [enc setBuffer:writeSet.voiceDescsBuf  offset:0 atIndex:3];
 
         uint32_t nv = (uint32_t)numVoices;
         uint32_t ns = (uint32_t)numSamples;
         [enc setBytes:&nv length:sizeof(uint32_t) atIndex:4];
         [enc setBytes:&ns length:sizeof(uint32_t) atIndex:5];
 
-        // Total threads: numVoices × numSamples
-        // Each thread handles one (voice, sample) pair
         NSUInteger totalThreads = (NSUInteger)(numVoices * numSamples);
         NSUInteger tgSize = MIN(totalThreads,
                                 _impl->pipeline.maxTotalThreadsPerThreadgroup);
@@ -250,37 +338,68 @@ void MetalSineBank::processBlock(
        threadsPerThreadgroup:MTLSizeMake(tgSize, 1, 1)];
 
         [enc endEncoding];
-        [cmdBuf commit];
-        [cmdBuf waitUntilCompleted];
 
-        // Read per-voice results from shared memory
-        memcpy(output, _impl->outputBuf.contents,
-               (size_t)(numVoices * numSamples) * sizeof(float));
+        // Completion handler: fires on a Metal-internal thread when GPU finishes.
+        // Captures writeIdx by value (safe — it's an int, not a pointer to stack).
+        // Captures _impl by value (raw pointer — safe as long as shutdown() drains
+        // the queue before deallocating).
+        auto* impl = _impl;
+        [cmdBuf addCompletedHandler:^(id<MTLCommandBuffer> /*buffer*/) {
+            impl->sets[writeIdx].gpuDone.store(true, std::memory_order_release);
+        }];
+
+        // Submit to GPU — returns immediately! Audio thread is NOT blocked.
+        [cmdBuf commit];
 
         _impl->dispatchCount++;
         if (_impl->dispatchCount == 1 || _impl->dispatchCount % 10000 == 0) {
-            NSLog(@"[KawaiiGPU] dispatch #%llu — %d voices × %d osc × %d samples (per-voice)",
+            NSLog(@"[KawaiiGPU] async dispatch #%llu — %d voices × %d osc × %d samples",
                   _impl->dispatchCount, numVoices, numOscillators, numSamples);
         }
     }
+
+    // Flip to other buffer set for next call
+    _impl->nextWriteIdx = 1 - _impl->nextWriteIdx;
+    _impl->hasPreviousResult = true;
 }
 
 void MetalSineBank::shutdown()
 {
-    if (!_impl) return;
-    _impl->oscParamsBuf  = nil;
-    _impl->envValuesBuf  = nil;
-    _impl->outputBuf     = nil;
-    _impl->voiceDescsBuf = nil;
+    if (!_impl || !_impl->available) return;
+
+    // Drain the command queue: submit an empty command buffer and wait.
+    // This ensures all in-flight GPU work completes before we release buffers,
+    // preventing completion handlers from accessing freed memory.
+    @autoreleasepool {
+        id<MTLCommandBuffer> fence = [_impl->commandQueue commandBuffer];
+        [fence commit];
+        [fence waitUntilCompleted];
+    }
+
+    for (auto& set : _impl->sets)
+    {
+        set.oscParamsBuf  = nil;
+        set.envValuesBuf  = nil;
+        set.outputBuf     = nil;
+        set.voiceDescsBuf = nil;
+        set.gpuDone.store(false);
+    }
     _impl->pipeline      = nil;
     _impl->commandQueue  = nil;
     _impl->device        = nil;
     _impl->available     = false;
+    _impl->hasPreviousResult = false;
 }
 
 bool MetalSineBank::isAvailable() const
 {
     return _impl && _impl->available;
+}
+
+int MetalSineBank::getLatencySamples() const
+{
+    if (!_impl || !_impl->available) return 0;
+    return _impl->maxBlockSize;  // one buffer of latency from double buffering
 }
 
 }}} // namespaces
