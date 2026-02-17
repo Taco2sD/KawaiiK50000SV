@@ -183,6 +183,7 @@ public:
     }
 
     int getNoteNumber() const { return noteNumber; }
+    double getVelocity() const { return velocity; }
 
     // Public so the processor can set per-partial ADSR and level directly
     std::array<Partial, kMaxPartials> partials;

@@ -10,7 +10,9 @@
 #include "pluginterfaces/vst/ivstevents.h"
 #include "../entry/KawaiiCids.h"
 #include "KawaiiVoice.h"
+#include "../gpu/MetalSineBank.h"
 #include <array>
+#include <vector>
 
 namespace Steinberg {
 namespace Vst {
@@ -36,9 +38,18 @@ public:
 private:
     void updateParameters();
     void processEvent(const Steinberg::Vst::Event& event);
+    void processBlockGPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol);
+    void processBlockCPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol);
 
     std::array<KawaiiVoice, kMaxVoices> voices;
     std::array<ParamValue, kNumParams> params;
+
+    // GPU synthesis
+    MetalSineBank metalSineBank;
+    bool useGPU = false;
+    std::vector<OscillatorParams> gpuOscParams;
+    std::vector<float> gpuEnvValues;
+    std::vector<float> gpuOutput;
 };
 
 } // namespace Kawaii

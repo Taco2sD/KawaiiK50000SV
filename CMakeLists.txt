@@ -121,6 +121,7 @@ set(PLUGIN_SOURCES
     source/processor/KawaiiProcessor.cpp        # Audio processor
     source/controller/KawaiiController.cpp      # Parameter controller
     source/editor/KawaiiEditor.cpp              # Custom VSTGUI editor
+    source/gpu/MetalSineBank.mm                 # Metal GPU compute for additive synthesis
 )
 
 ##############################################################################
@@ -192,6 +193,7 @@ if(APPLE)
     find_library(AUDIOTOOLBOX_LIBRARY AudioToolbox)
     find_library(QUARTZCORE_LIBRARY QuartzCore)
     find_library(ACCELERATE_LIBRARY Accelerate)
+    find_library(METAL_LIBRARY Metal)
 
     target_link_libraries(KawaiiK50000SV PRIVATE
         ${COREFOUNDATION_LIBRARY}
@@ -200,6 +202,7 @@ if(APPLE)
         ${AUDIOTOOLBOX_LIBRARY}
         ${QUARTZCORE_LIBRARY}
         ${ACCELERATE_LIBRARY}
+        ${METAL_LIBRARY}
         vstgui
     )
 endif()

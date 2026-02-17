@@ -1,5 +1,12 @@
 /**
  * KawaiiProcessor.cpp — K50V: 16-partial additive synth with per-partial ADSR
+ *
+ * Supports two render paths:
+ *   GPU (Metal compute) — sin() + summation on Apple Silicon GPU
+ *   CPU (fallback)      — original per-sample loop
+ *
+ * ADSR envelopes always run on CPU (cheap, stateful).
+ * Phase tracking uses double precision on CPU; GPU receives float32 per block.
  */
 
 #include "KawaiiProcessor.h"
@@ -61,9 +68,24 @@ tresult PLUGIN_API KawaiiProcessor::setActive(TBool state)
     {
         for (auto& voice : voices)
             voice.setSampleRate(processSetup.sampleRate);
+
+        // Initialize Metal GPU compute
+        int maxOsc = kMaxVoices * kMaxPartials;
+        int maxBlock = (int)processSetup.maxSamplesPerBlock;
+        if (maxBlock <= 0) maxBlock = 4096;
+
+        useGPU = metalSineBank.init(maxOsc, maxBlock);
+
+        // Allocate scratch buffers for GPU path
+        gpuOscParams.resize((size_t)maxOsc);
+        gpuEnvValues.resize((size_t)(maxOsc * maxBlock));
+        gpuOutput.resize((size_t)maxBlock);
     }
     else
     {
+        metalSineBank.shutdown();
+        useGPU = false;
+
         for (auto& voice : voices)
             for (auto& p : voice.partials)
                 p.reset();
@@ -150,6 +172,89 @@ void KawaiiProcessor::processEvent(const Event& event)
     }
 }
 
+// ============================================================================
+// GPU render path
+// ============================================================================
+
+void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)
+{
+    double sr = processSetup.sampleRate;
+    int numOsc = 0;
+
+    // 1. Collect oscillator params and compute per-sample ADSR on CPU
+    for (auto& voice : voices)
+    {
+        if (!voice.isActive()) continue;
+
+        double velScale = voice.getVelocity() / static_cast<double>(kMaxPartials);
+
+        for (int p = 0; p < kMaxPartials; p++)
+        {
+            auto& partial = voice.partials[p];
+            if (!partial.envelope.isActive()) continue;
+
+            gpuOscParams[(size_t)numOsc] = {
+                static_cast<float>(partial.phase),
+                static_cast<float>(partial.frequency / sr),
+                static_cast<float>(partial.level),
+                static_cast<float>(velScale)
+            };
+
+            // Run ADSR forward per-sample, capturing values for GPU
+            for (int32 s = 0; s < numSamples; s++)
+                gpuEnvValues[(size_t)(numOsc * numSamples + s)] = static_cast<float>(partial.envelope.process());
+
+            // Advance phase on CPU (double precision)
+            partial.phase += numSamples * (partial.frequency / sr);
+            partial.phase -= static_cast<int>(partial.phase); // wrap to [0, 1)
+
+            numOsc++;
+        }
+    }
+
+    // 2. GPU dispatch: sin() + summation
+    metalSineBank.processBlock(gpuOscParams.data(), gpuEnvValues.data(),
+                               numOsc, gpuOutput.data(), numSamples);
+
+    // 3. Write to VST3 output buffers (mono → stereo, apply master volume)
+    for (int32 s = 0; s < numSamples; s++)
+    {
+        float sample = std::clamp(gpuOutput[(size_t)s] * static_cast<float>(masterVol), -1.0f, 1.0f);
+        for (int32 ch = 0; ch < numChannels; ch++)
+            outputs[ch][s] = sample;
+    }
+}
+
+// ============================================================================
+// CPU render path (fallback)
+// ============================================================================
+
+void KawaiiProcessor::processBlockCPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)
+{
+    for (auto& voice : voices)
+    {
+        if (!voice.isActive())
+            continue;
+
+        for (int32 i = 0; i < numSamples; i++)
+        {
+            double outL = 0.0, outR = 0.0;
+            voice.process(&outL, &outR);
+
+            for (int32 ch = 0; ch < numChannels; ch++)
+                outputs[ch][i] += static_cast<float>((ch == 0 ? outL : outR) * masterVol);
+        }
+    }
+
+    for (int32 ch = 0; ch < numChannels; ch++)
+        for (int32 i = 0; i < numSamples; i++)
+            outputs[ch][i] = std::clamp(outputs[ch][i], -1.0f, 1.0f);
+}
+
+// ============================================================================
+// VST3 process callback
+// ============================================================================
+
 tresult PLUGIN_API KawaiiProcessor::process(ProcessData& data)
 {
     // Parameter changes
@@ -199,27 +304,14 @@ tresult PLUGIN_API KawaiiProcessor::process(ProcessData& data)
         return kResultFalse;
 
     for (int32 ch = 0; ch < numChannels; ch++)
-        memset(outputs[ch], 0, numSamples * sizeof(float));
+        memset(outputs[ch], 0, (size_t)numSamples * sizeof(float));
 
     double masterVol = params[kParamMasterVolume];
-    for (auto& voice : voices)
-    {
-        if (!voice.isActive())
-            continue;
 
-        for (int32 i = 0; i < numSamples; i++)
-        {
-            double outL = 0.0, outR = 0.0;
-            voice.process(&outL, &outR);
-
-            for (int32 ch = 0; ch < numChannels; ch++)
-                outputs[ch][i] += static_cast<float>((ch == 0 ? outL : outR) * masterVol);
-        }
-    }
-
-    for (int32 ch = 0; ch < numChannels; ch++)
-        for (int32 i = 0; i < numSamples; i++)
-            outputs[ch][i] = std::clamp(outputs[ch][i], -1.0f, 1.0f);
+    if (useGPU)
+        processBlockGPU(outputs, numChannels, numSamples, masterVol);
+    else
+        processBlockCPU(outputs, numChannels, numSamples, masterVol);
 
     return kResultOk;
 }
