@@ -26,7 +26,24 @@ namespace Vst {
 namespace Kawaii {
 
 // ============================================================================
-// ADSR Envelope — used for both per-partial amp and the filter
+// ADSR Envelope — Analog RC-style curves
+//
+// Real analog synths use capacitor charge/discharge curves, not linear ramps.
+// This models those curves using one-pole exponential coefficients:
+//
+//   Attack:  Concave curve — charges toward an overshoot target (1.5) so the
+//            approach to 1.0 has a natural rounded shape, like a capacitor
+//            charging through a resistor. coeff = 1 - e^(-1/(t*sr))
+//
+//   Decay:   Exponential fall toward sustain level — like a cap discharging
+//            through a resistor to a voltage rail (the sustain level).
+//
+//   Release: Exponential fall toward zero — same RC discharge shape.
+//
+// The overshoot target (kAttackTarget) controls how concave the attack is:
+//   - 1.0 = perfectly linear (no overshoot)
+//   - 1.5 = gentle analog curve (Moog-ish)
+//   - 2.0 = very concave (fast start, slow finish)
 // ============================================================================
 
 class ADSREnvelope
@@ -34,18 +51,46 @@ class ADSREnvelope
 public:
     enum Stage { Attack, Decay, Sustain, Release, Idle };
 
+    // Overshoot target for attack curve — higher = more concave
+    static constexpr double kAttackTarget = 1.5;
+
+    // Threshold for "close enough" to target (avoids infinite asymptote)
+    static constexpr double kSilenceThreshold = 0.001;
+
     ADSREnvelope()
         : stage(Idle), currentValue(0.0)
-        , attackTime(0.01), decayTime(0.1)
-        , sustainLevel(0.7), releaseTime(0.3)
+        , attackCoeff(0.01), decayCoeff(0.01), releaseCoeff(0.01)
+        , sustainLevel(0.7)
         , sampleRate(44100.0)
     {}
 
     void setSampleRate(double sr) { sampleRate = sr; }
-    void setAttack(double seconds)  { attackTime  = std::max(0.001, seconds); }
-    void setDecay(double seconds)   { decayTime   = std::max(0.001, seconds); }
-    void setSustain(double level)   { sustainLevel = std::clamp(level, 0.0, 1.0); }
-    void setRelease(double seconds) { releaseTime = std::max(0.001, seconds); }
+
+    // Convert time in seconds to a one-pole RC coefficient
+    // coeff = 1 - e^(-1/(time_in_seconds * sampleRate))
+    // Smaller coeff = slower approach, larger = faster
+    void setAttack(double seconds)
+    {
+        seconds = std::max(0.001, seconds);
+        attackCoeff = 1.0 - std::exp(-1.0 / (seconds * sampleRate));
+    }
+
+    void setDecay(double seconds)
+    {
+        seconds = std::max(0.001, seconds);
+        decayCoeff = 1.0 - std::exp(-1.0 / (seconds * sampleRate));
+    }
+
+    void setSustain(double level)
+    {
+        sustainLevel = std::clamp(level, 0.0, 1.0);
+    }
+
+    void setRelease(double seconds)
+    {
+        seconds = std::max(0.001, seconds);
+        releaseCoeff = 1.0 - std::exp(-1.0 / (seconds * sampleRate));
+    }
 
     void noteOn()  { stage = Attack; }
     void noteOff() { if (stage != Idle) stage = Release; }
@@ -55,20 +100,39 @@ public:
         switch (stage)
         {
             case Attack:
-                currentValue += 1.0 / (attackTime * sampleRate);
-                if (currentValue >= 1.0) { currentValue = 1.0; stage = Decay; }
+                // Charge toward overshoot target — creates concave curve to 1.0
+                currentValue += (kAttackTarget - currentValue) * attackCoeff;
+                if (currentValue >= 1.0)
+                {
+                    currentValue = 1.0;
+                    stage = Decay;
+                }
                 break;
+
             case Decay:
-                currentValue -= (1.0 - sustainLevel) / (decayTime * sampleRate);
-                if (currentValue <= sustainLevel) { currentValue = sustainLevel; stage = Sustain; }
+                // Exponential approach toward sustain level (RC discharge)
+                currentValue += (sustainLevel - currentValue) * decayCoeff;
+                if (std::abs(currentValue - sustainLevel) < kSilenceThreshold)
+                {
+                    currentValue = sustainLevel;
+                    stage = Sustain;
+                }
                 break;
+
             case Sustain:
                 currentValue = sustainLevel;
                 break;
+
             case Release:
-                currentValue -= currentValue / (releaseTime * sampleRate);
-                if (currentValue <= 0.001) { currentValue = 0.0; stage = Idle; }
+                // Exponential decay toward zero (RC discharge)
+                currentValue += (0.0 - currentValue) * releaseCoeff;
+                if (currentValue <= kSilenceThreshold)
+                {
+                    currentValue = 0.0;
+                    stage = Idle;
+                }
                 break;
+
             case Idle:
                 currentValue = 0.0;
                 break;
@@ -82,7 +146,8 @@ public:
 private:
     Stage  stage;
     double currentValue;
-    double attackTime, decayTime, sustainLevel, releaseTime;
+    double attackCoeff, decayCoeff, releaseCoeff;
+    double sustainLevel;
     double sampleRate;
 };
 
@@ -103,9 +168,11 @@ public:
 
     void setSampleRate(double sr)
     {
-        // ~5ms smoothing time: coeff = 1 - e^(-2π / (time_in_samples))
-        // 5ms at sr=44100 ≈ 220.5 samples → coeff ≈ 0.028
-        double timeSamples = 0.005 * sr;
+        // ~20ms smoothing time: long enough to eliminate audible stepping
+        // when the user drags a knob, but short enough to feel responsive.
+        // coeff = 1 - e^(-2π / (time_in_samples))
+        // 20ms at sr=44100 ≈ 882 samples → coeff ≈ 0.007
+        double timeSamples = 0.020 * sr;
         coeff = 1.0 - std::exp(-2.0 * M_PI / timeSamples);
     }
 

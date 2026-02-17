@@ -157,7 +157,6 @@ void KawaiiEditor::createControls()
 
     // --- Master knobs (top area, after title) ---
     partialKnob("Volume", kParamMasterVolume, 180, kMasterY);
-    partialKnob("Tune", kParamMasterTune, 250, kMasterY);
 
     // ===================================================================
     // PARTIALS GRID — 4 groups of 8
