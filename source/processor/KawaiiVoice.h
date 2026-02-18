@@ -260,7 +260,7 @@ public:
         }
 
         filterEnvelope.noteOn();
-        filter.init();        // Reset filter state for new note
+        filter.resetVoice(0); // Reset voice 0's filter registers without losing sampleRate
         cutoffSmoother.snap();
         resoSmoother.snap();
         filterBlockPos = 0;   // Reset sub-block position
@@ -421,7 +421,17 @@ private:
     // Delay line memory for Comb filters (managed per-voice)
     std::vector<float> delayLineMemory;
 
-    // Configure the sst-filter from type table + subtype
+    // Configure the sst-filter from type table + subtype.
+    //
+    // Uses availableModelConfigurations() to get the EXACT valid configs
+    // for the model, then filters to the desired passband/slope/drive from
+    // our filter type table. The subtype index selects among the remaining
+    // valid variants (cycling through different drive modes, slopes, or
+    // submodels depending on what the model supports).
+    //
+    // This replaces the old approach of setting individual fields and calling
+    // potentialValuesFor(), which could produce invalid ModelConfig tuples
+    // (e.g., NotchMild drive on an LP passband for VemberClassic).
     void configureFilter(int typeIndex, int subType)
     {
         const auto& types = getFilterTypes();
@@ -430,60 +440,78 @@ private:
 
         const auto& entry = types[(size_t)typeIndex];
 
-        // Set model and configuration
+        // 1. Set the model
         filter.setFilterModel(entry.model);
-        filter.setPassband(entry.passband);
-        filter.setSlope(entry.slope);
-        filter.setDriveMode(entry.drive);
-        filter.setSubmodel(entry.submodel);
 
-        // Apply subtype variant (cycles through available DriveMode or Slope options)
-        applySubType(entry.model, subType);
+        // 2. Get ALL valid configurations for this model (sorted for determinism)
+        auto allConfigs = sfpp::Filter::availableModelConfigurations(entry.model, true);
 
-        // Allocate delay line memory for Comb filters
-        auto mc = filter.getModelConfiguration();
-        auto dlSize = sfpp::Filter::requiredDelayLinesSizes(entry.model, mc);
+        // 3. Filter to configs matching our desired passband (and slope if specified)
+        //    This gives us only configs that are actually valid for the passband
+        //    we want, avoiding cross-passband contamination.
+        std::vector<sfpp::ModelConfig> matching;
+        for (const auto& cfg : allConfigs)
+        {
+            // Must match passband (unless table entry is UNSUPPORTED = don't care)
+            if (entry.passband != sfpp::Passband::UNSUPPORTED && cfg.pt != entry.passband)
+                continue;
+
+            // For Comb filters: match slope (the primary dimension)
+            if (entry.slope != sfpp::Slope::UNSUPPORTED && cfg.st != sfpp::Slope::UNSUPPORTED
+                && cfg.st != entry.slope)
+                continue;
+
+            matching.push_back(cfg);
+        }
+
+        // 4. If we got matches, use the subtype index to select among them.
+        //    If no matches (shouldn't happen), fall back to all configs.
+        sfpp::ModelConfig chosen;
+        if (!matching.empty())
+        {
+            int idx = subType % (int)matching.size();
+            chosen = matching[(size_t)idx];
+        }
+        else if (!allConfigs.empty())
+        {
+            // Safety fallback: use closestValidModelTo with our desired config
+            sfpp::ModelConfig desired(entry.passband, entry.slope, entry.drive, entry.submodel);
+            chosen = sfpp::closestValidModelTo(entry.model, desired);
+        }
+        else
+        {
+            // No configs at all — fall back to SVF LP
+            filter.setFilterModel(sfpp::FilterModel::CytomicSVF);
+            chosen = sfpp::ModelConfig(sfpp::Passband::LP);
+        }
+
+        // 5. Set the validated configuration atomically
+        filter.setModelConfiguration(chosen);
+
+        // 6. Allocate delay line memory for Comb filters
+        auto dlSize = sfpp::Filter::requiredDelayLinesSizes(entry.model, chosen);
         if (dlSize > 0)
         {
             delayLineMemory.resize(dlSize, 0.0f);
+            std::fill(delayLineMemory.begin(), delayLineMemory.end(), 0.0f);
             filter.provideDelayLine(0, delayLineMemory.data());
         }
 
-        // Validate and initialize the filter configuration
+        // 7. Validate and initialize the filter
         filter.setMono();  // Only voice 0 active in the SIMD quad
-        filter.prepareInstance();
-        filter.init();
+        bool ok = filter.prepareInstance();
+
+        // If prepareInstance failed, fall back to SVF LP (always valid)
+        if (!ok)
+        {
+            filter.setFilterModel(sfpp::FilterModel::CytomicSVF);
+            filter.setModelConfiguration(sfpp::ModelConfig(sfpp::Passband::LP));
+            filter.setMono();
+            filter.prepareInstance();
+        }
 
         currentFilterTypeIndex = typeIndex;
         currentFilterSubType = subType;
-    }
-
-    // Apply subtype variant by cycling through available drive/slope/submodel options
-    void applySubType(sfpp::FilterModel model, int subType)
-    {
-        // Get available drive modes for this model
-        auto drives = sfpp::potentialValuesFor<sfpp::DriveMode>(model);
-        if (!drives.empty() && subType < (int)drives.size())
-        {
-            filter.setDriveMode(drives[(size_t)subType]);
-            return;
-        }
-
-        // Try slopes
-        auto slopes = sfpp::potentialValuesFor<sfpp::Slope>(model);
-        if (!slopes.empty() && subType < (int)slopes.size())
-        {
-            filter.setSlope(slopes[(size_t)subType]);
-            return;
-        }
-
-        // Try submodels
-        auto subs = sfpp::potentialValuesFor<sfpp::FilterSubModel>(model);
-        if (!subs.empty() && subType < (int)subs.size())
-        {
-            filter.setSubmodel(subs[(size_t)subType]);
-            return;
-        }
     }
 };
 
