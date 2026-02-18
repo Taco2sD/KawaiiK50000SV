@@ -327,10 +327,22 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
     //
     // Uses prevGpuVoiceMap (saved from the PREVIOUS call) to know which
     // voice[] entry each GPU voice index corresponds to.
+    //
+    // Sub-block processing (Surge XT pattern):
+    //   The buffer is subdivided into 32-sample sub-blocks. At each sub-block
+    //   boundary, target filter coefficients are computed from the smoothed
+    //   cutoff/resonance/envelope. Within the sub-block, coefficients are
+    //   linearly interpolated per-sample (a1 += da1, etc.), eliminating
+    //   zipper noise from parameter changes. This means tan() is called
+    //   once per sub-block (~1378×/sec) instead of once per sample (~44100×/sec).
     // =========================================================================
+
+    static constexpr int kSubBlockSize = 32;  // ~0.7ms at 44.1kHz — matches Surge XT
 
     if (prevNumVoices > 0 && prevNumSamples > 0)
     {
+        int totalSamples = std::min(prevNumSamples, numSamples);
+
         for (int i = 0; i < prevNumVoices; i++)
         {
             int vIdx = prevGpuVoiceMap[(size_t)i];
@@ -338,31 +350,43 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
 
             float* voiceBuf = &gpuPerVoiceOutput[(size_t)(i * prevNumSamples)];
 
-            for (int32 s = 0; s < prevNumSamples && s < numSamples; s++)
+            // Process in sub-blocks of kSubBlockSize samples
+            for (int subStart = 0; subStart < totalSamples; subStart += kSubBlockSize)
             {
-                double sample = static_cast<double>(voiceBuf[s]);
+                int subEnd = std::min(subStart + kSubBlockSize, totalSamples);
+                int subLen = subEnd - subStart;
 
-                // Advance filter state per-sample
-                double envValue     = voice.processFilterEnvelope();
-                double smoothedNorm = voice.processFilterCutoffSmooth();
-                double smoothedReso = voice.processFilterResoSmooth();
+                // Advance smoothers and envelope to the END of this sub-block
+                // to get the target parameter values for coefficient computation.
+                // (Evaluating at the end means the interpolation approaches the
+                // target by the last sample — matching Surge's convention.)
+                double envValue = 0.0, smoothedNorm = 0.0, smoothedReso = 0.0;
+                for (int s = 0; s < subLen; s++)
+                {
+                    envValue     = voice.processFilterEnvelope();
+                    smoothedNorm = voice.processFilterCutoffSmooth();
+                    smoothedReso = voice.processFilterResoSmooth();
+                }
 
-                // Convert smoothed normalized cutoff to Hz (exponential mapping)
-                double baseCutoffHz = 20.0 * std::pow(1000.0, smoothedNorm);
+                // Compute effective cutoff Hz using voice helper
+                // (exponential Hz mapping + envelope mod + keytrack)
+                double effectiveCutoff = voice.computeEffectiveCutoff(smoothedNorm, envValue);
 
-                // Bipolar env depth: -1 to +1 → modulates cutoff ±10kHz
-                double envMod = voice.getFilterEnvDepth() * envValue * 10000.0;
+                // Compute target coefficients + set up per-sample interpolation.
+                // CytomicSVF expects raw resonance 0..0.98, NOT Q.
+                // tan() is called ONCE here, then coefficients ramp linearly
+                // across subLen samples via processBlockStep().
+                voice.prepareFilterBlock(effectiveCutoff, smoothedReso, subLen);
 
-                // Keytrack: 0 = none, 1 = full (100 Hz/semitone from C3)
-                double keyMod = voice.getFilterKeytrack() * (voice.getNoteNumber() - 60) * 100.0;
+                // Tight inner loop: filter + mix to stereo
+                for (int32 s = subStart; s < subEnd; s++)
+                {
+                    double sample = static_cast<double>(voiceBuf[s]);
+                    sample = voice.filterBlockStep(sample);
 
-                double effectiveCutoff = std::clamp(baseCutoffHz + envMod + keyMod, 20.0, 20000.0);
-                double Q = 0.5 + smoothedReso * 24.5;
-
-                sample = voice.applyFilter(sample, effectiveCutoff, Q);
-
-                for (int32 ch = 0; ch < numChannels; ch++)
-                    outputs[ch][s] += static_cast<float>(sample * masterVol);
+                    for (int32 ch = 0; ch < numChannels; ch++)
+                        outputs[ch][s] += static_cast<float>(sample * masterVol);
+                }
             }
         }
 
