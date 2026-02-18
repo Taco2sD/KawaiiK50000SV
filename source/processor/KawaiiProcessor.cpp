@@ -1,10 +1,10 @@
 /**
- * KawaiiProcessor.cpp — K50V: 32-partial additive synth with ZDF SVF filter
+ * KawaiiProcessor.cpp — K50V: 32-partial additive synth with sst-filters
  *
  * Async double-buffered GPU+CPU pipeline:
  *   Phase 1 (CPU): Pre-compute per-partial ADSR envelopes, build VoiceDescriptors
  *   Phase 2 (GPU): Submit to Metal (non-blocking), retrieve PREVIOUS block's results
- *   Phase 3 (CPU): Per-voice ZDF SVF filter on previous results + mix to stereo
+ *   Phase 3 (CPU): Per-voice sst-filters processing on previous results + mix to stereo
  *
  * The audio thread never blocks on GPU. One buffer of latency, DAW-compensated via PDC.
  * Falls back to pure CPU path if Metal is unavailable.
@@ -40,8 +40,8 @@ KawaiiProcessor::KawaiiProcessor()
         params[partialParam(i, kPartialOffRelease)] = 0.3;
     }
 
-    // Filter defaults: fully open LP, no modulation
-    params[kParamFilterType]    = 0.0;   // LP
+    // Filter defaults: SVF LP fully open, no modulation
+    params[kParamFilterType]    = 0.0;   // SVF LP (index 0)
     params[kParamFilterCutoff]  = ParamRanges::kFilterCutoffDefault;  // 1.0 = 20kHz (fully open)
     params[kParamFilterReso]    = ParamRanges::kFilterResoDefault;    // 0.0 = no resonance
     params[kParamFilterEnvAtk]  = 0.01;
@@ -50,6 +50,7 @@ KawaiiProcessor::KawaiiProcessor()
     params[kParamFilterEnvRel]  = 0.3;
     params[kParamFilterEnvDep]  = ParamRanges::kFilterEnvDepthDefault;  // 0.5 = no modulation
     params[kParamFilterKeytrk]  = ParamRanges::kFilterKeytrackDefault;  // 0.0 = no tracking
+    params[kParamFilterSubType] = 0.0;   // Default subtype variant
 }
 
 KawaiiProcessor::~KawaiiProcessor()
@@ -141,9 +142,13 @@ void KawaiiProcessor::updateParameters()
     double filterCutoffNorm = params[kParamFilterCutoff];
     double filterReso       = params[kParamFilterReso];
 
-    // Filter type: discrete 0–3 mapped from normalized 0–1
-    int filterTypeInt = static_cast<int>(params[kParamFilterType] * (kNumFilterTypes - 1) + 0.5);
-    FilterType filterType = static_cast<FilterType>(std::clamp(filterTypeInt, 0, kNumFilterTypes - 1));
+    // Filter type: discrete 0–32 mapped from normalized 0–1 (33 sst-filter types)
+    int filterTypeIndex = static_cast<int>(params[kParamFilterType] * (kNumFilterTypes - 1) + 0.5);
+    filterTypeIndex = std::clamp(filterTypeIndex, 0, kNumFilterTypes - 1);
+
+    // Filter subtype: discrete 0–3 mapped from normalized 0–1
+    int filterSubType = static_cast<int>(params[kParamFilterSubType] * 3 + 0.5);
+    filterSubType = std::clamp(filterSubType, 0, 3);
 
     // Filter envelope ADSR (same exponential time mapping as partial envelopes)
     double fAtk = normalizedToMs(params[kParamFilterEnvAtk], kEnvAttackMin, kEnvAttackMax) / 1000.0;
@@ -179,7 +184,7 @@ void KawaiiProcessor::updateParameters()
         // --- Filter params ---
         voice.setFilterCutoffNorm(filterCutoffNorm);
         voice.setFilterResonance(filterReso);
-        voice.setFilterType(filterType);
+        voice.setFilterConfig(filterTypeIndex, filterSubType);
         voice.setFilterEnvAttack(fAtk);
         voice.setFilterEnvDecay(fDec);
         voice.setFilterEnvSustain(fSus);
@@ -328,16 +333,13 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
     // Uses prevGpuVoiceMap (saved from the PREVIOUS call) to know which
     // voice[] entry each GPU voice index corresponds to.
     //
-    // Sub-block processing (Surge XT pattern):
-    //   The buffer is subdivided into 32-sample sub-blocks. At each sub-block
-    //   boundary, target filter coefficients are computed from the smoothed
-    //   cutoff/resonance/envelope. Within the sub-block, coefficients are
-    //   linearly interpolated per-sample (a1 += da1, etc.), eliminating
-    //   zipper noise from parameter changes. This means tan() is called
-    //   once per sub-block (~1378×/sec) instead of once per sample (~44100×/sec).
+    // Sub-block processing (sst-filters pattern):
+    //   The buffer is subdivided into kFilterBlockSize (32) sample sub-blocks.
+    //   At each boundary, target filter coefficients are computed from smoothed
+    //   cutoff/resonance/envelope. The sst-filters library internally
+    //   interpolates coefficients per-sample via its deltaC mechanism,
+    //   eliminating zipper noise from parameter changes.
     // =========================================================================
-
-    static constexpr int kSubBlockSize = 32;  // ~0.7ms at 44.1kHz — matches Surge XT
 
     if (prevNumVoices > 0 && prevNumSamples > 0)
     {
@@ -350,10 +352,10 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
 
             float* voiceBuf = &gpuPerVoiceOutput[(size_t)(i * prevNumSamples)];
 
-            // Process in sub-blocks of kSubBlockSize samples
-            for (int subStart = 0; subStart < totalSamples; subStart += kSubBlockSize)
+            // Process in sub-blocks matching sst-filters' internal block size
+            for (int subStart = 0; subStart < totalSamples; subStart += kFilterBlockSize)
             {
-                int subEnd = std::min(subStart + kSubBlockSize, totalSamples);
+                int subEnd = std::min(subStart + kFilterBlockSize, totalSamples);
                 int subLen = subEnd - subStart;
 
                 // Advance smoothers and envelope to the END of this sub-block
@@ -372,21 +374,22 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
                 // (exponential Hz mapping + envelope mod + keytrack)
                 double effectiveCutoff = voice.computeEffectiveCutoff(smoothedNorm, envValue);
 
-                // Compute target coefficients + set up per-sample interpolation.
-                // CytomicSVF expects raw resonance 0..0.98, NOT Q.
-                // tan() is called ONCE here, then coefficients ramp linearly
-                // across subLen samples via processBlockStep().
-                voice.prepareFilterBlock(effectiveCutoff, smoothedReso, subLen);
+                // Compute target coefficients for this sub-block.
+                // sst-filters internally interpolates per-sample via deltaC.
+                voice.prepareFilterBlock(effectiveCutoff, smoothedReso);
 
-                // Tight inner loop: filter + mix to stereo
+                // Tight inner loop: filter each sample through sst-filters + mix to stereo
                 for (int32 s = subStart; s < subEnd; s++)
                 {
-                    double sample = static_cast<double>(voiceBuf[s]);
+                    float sample = voiceBuf[s];
                     sample = voice.filterBlockStep(sample);
 
                     for (int32 ch = 0; ch < numChannels; ch++)
                         outputs[ch][s] += static_cast<float>(sample * masterVol);
                 }
+
+                // Signal end of sub-block so sst-filters snaps coefficients
+                voice.concludeFilterBlock();
             }
         }
 
@@ -402,7 +405,7 @@ void KawaiiProcessor::processBlockGPU(float** outputs, int32 numChannels, int32 
 }
 
 // ============================================================================
-// CPU render path — includes per-voice ZDF SVF filter
+// CPU render path — includes per-voice sst-filters processing
 // ============================================================================
 
 void KawaiiProcessor::processBlockCPU(float** outputs, int32 numChannels, int32 numSamples, double masterVol)

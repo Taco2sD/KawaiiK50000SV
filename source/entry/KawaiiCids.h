@@ -2,7 +2,7 @@
  * KawaiiCids.h — Component IDs and Parameter Definitions
  *
  * "Kawaii K50V" — 32-partial additive synth with per-partial ADSR
- *                 and Cytomic ZDF SVF filter (LP/HP/BP/Notch).
+ *                 and Surge XT sst-filters (33 filter types).
  *
  * Parameter layout (contiguous IDs — no gaps):
  *   0        Master Volume
@@ -11,7 +11,7 @@
  *   7-11     Partial 2
  *   ...
  *   157-161  Partial 32
- *   162      Filter Type (LP=0, HP=1, BP=2, Notch=3)
+ *   162      Filter Type (0–32, index into KawaiiFilterTypes table)
  *   163      Filter Cutoff
  *   164      Filter Resonance
  *   165      Filter Env Attack
@@ -20,7 +20,8 @@
  *   168      Filter Env Release
  *   169      Filter Env Depth (bipolar: 0.5 = none)
  *   170      Filter Keytrack
- *   kNumParams = 171
+ *   171      Filter SubType (0–3, subtype variant)
+ *   kNumParams = 172
  */
 
 #pragma once
@@ -60,16 +61,6 @@ inline constexpr Vst::ParamID partialParam(int partial, int offset)
 // partialParam(31, 4) = 2 + 31*5 + 4 = 161, so filter starts at 162
 static constexpr int kFilterParamBase = kPartialParamBase + kMaxPartials * kPartialParamStride;
 
-// Filter types for the discrete type selector
-enum FilterType : int
-{
-    kFilterLP    = 0,  // Low-pass (12dB/oct)
-    kFilterHP    = 1,  // High-pass (12dB/oct)
-    kFilterBP    = 2,  // Band-pass
-    kFilterNotch = 3,  // Notch (band-reject)
-    kNumFilterTypes = 4
-};
-
 enum KawaiiParamID : Vst::ParamID
 {
     kParamMasterVolume = 0,
@@ -80,8 +71,8 @@ enum KawaiiParamID : Vst::ParamID
     // ...
     // partialParam(31, 0)=157 ... partialParam(31, 4)=161
 
-    // Filter section (9 params starting at 162)
-    kParamFilterType    = kFilterParamBase,      // 162
+    // Filter section (10 params starting at 162)
+    kParamFilterType    = kFilterParamBase,      // 162 (discrete: 0–32, sst-filters type index)
     kParamFilterCutoff  = kFilterParamBase + 1,  // 163
     kParamFilterReso    = kFilterParamBase + 2,  // 164
     kParamFilterEnvAtk  = kFilterParamBase + 3,  // 165
@@ -90,8 +81,9 @@ enum KawaiiParamID : Vst::ParamID
     kParamFilterEnvRel  = kFilterParamBase + 6,  // 168
     kParamFilterEnvDep  = kFilterParamBase + 7,  // 169 (bipolar: 0.5 = no mod)
     kParamFilterKeytrk  = kFilterParamBase + 8,  // 170
+    kParamFilterSubType = kFilterParamBase + 9,  // 171 (discrete: 0–3, filter variant)
 
-    kNumParams = kFilterParamBase + 9            // 171
+    kNumParams = kFilterParamBase + 10           // 172
 };
 
 } // namespace Kawaii

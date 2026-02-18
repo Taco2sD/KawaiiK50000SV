@@ -4,3 +4,12 @@
 [submodule "gpuaudio-sdk"]
 	path = gpuaudio-sdk
 	url = https://github.com/gpuaudio/gpuaudio-sdk.git
+[submodule "libs/sst-filters"]
+	path = libs/sst-filters
+	url = https://github.com/surge-synthesizer/sst-filters.git
+[submodule "libs/sst-basic-blocks"]
+	path = libs/sst-basic-blocks
+	url = https://github.com/surge-synthesizer/sst-basic-blocks.git
+[submodule "libs/simde"]
+	path = libs/simde
+	url = https://github.com/simd-everywhere/simde.git

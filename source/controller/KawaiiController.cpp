@@ -5,6 +5,7 @@
 #include "KawaiiController.h"
 #include "../entry/KawaiiCids.h"
 #include "../params/KawaiiParams.h"
+#include "../params/KawaiiFilterTypes.h"
 #include "../editor/KawaiiEditor.h"
 #include "pluginterfaces/base/ibstream.h"
 #include "pluginterfaces/base/ustring.h"
@@ -76,16 +77,24 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
             ParameterInfo::kCanAutomate, partialParam(i, kPartialOffRelease), 0, STR16("Partials"));
     }
 
-    // --- Filter section (9 params) ---
+    // --- Filter section (10 params) ---
     using namespace ParamRanges;
 
-    // Filter Type — discrete list param: LP, HP, BP, Notch
+    // Filter Type — discrete list param: 33 sst-filter types from lookup table
     auto* typeParam = new StringListParameter(
         STR16("Filter Type"), kParamFilterType, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
-    typeParam->appendString(STR16("Low Pass"));
-    typeParam->appendString(STR16("High Pass"));
-    typeParam->appendString(STR16("Band Pass"));
-    typeParam->appendString(STR16("Notch"));
+    {
+        const auto& filterTypes = getFilterTypes();
+        for (int i = 0; i < kNumFilterTypes; i++)
+        {
+            // Convert char* name to char16 for VST3 string list
+            const char* src = filterTypes[(size_t)i].name;
+            char16 wide[64];
+            for (int j = 0; j <= (int)strlen(src) && j < 63; j++)
+                wide[j] = static_cast<char16>(src[j]);
+            typeParam->appendString(wide);
+        }
+    }
     parameters.addParameter(typeParam);
 
     // Cutoff (normalized 0–1, exponential mapping 20Hz–20kHz in processor)
@@ -116,6 +125,15 @@ tresult PLUGIN_API KawaiiController::initialize(FUnknown* context)
     // Keytrack (0 = none, 1 = full)
     parameters.addParameter(STR16("Flt Keytrack"), STR16("%"), 0, kFilterKeytrackDefault,
         ParameterInfo::kCanAutomate, kParamFilterKeytrk, 0, STR16("Filter"));
+
+    // Filter SubType — discrete 0–3, cycles through drive/slope/submodel variants
+    auto* subTypeParam = new StringListParameter(
+        STR16("Filter SubType"), kParamFilterSubType, nullptr, ParameterInfo::kCanAutomate | ParameterInfo::kIsList);
+    subTypeParam->appendString(STR16("Sub 1"));
+    subTypeParam->appendString(STR16("Sub 2"));
+    subTypeParam->appendString(STR16("Sub 3"));
+    subTypeParam->appendString(STR16("Sub 4"));
+    parameters.addParameter(subTypeParam);
 
     return kResultOk;
 }

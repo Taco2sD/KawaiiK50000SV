@@ -26,8 +26,8 @@ cmake_minimum_required(VERSION 3.25)
 # LANGUAGES CXX OBJCXX — Objective-C++ is required by VSTGUI on macOS.
 project(KawaiiK50000SV VERSION 1.0.0 LANGUAGES CXX OBJCXX)
 
-# We use C++17 features (std::clamp, std::optional, structured bindings, etc.)
-set(CMAKE_CXX_STANDARD 17)
+# C++20 required by sst-filters / sst-basic-blocks
+set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 ##############################################################################
@@ -62,6 +62,28 @@ set(VSTGUI_DISABLE_UNITTESTS 1)
 add_subdirectory(${VST3_SDK_ROOT}/vstgui4/vstgui ${CMAKE_BINARY_DIR}/vstgui)
 
 include_directories(${VST3_SDK_ROOT}/vstgui4)
+
+##############################################################################
+# sst-filters — Surge XT filter library (all 35+ filter types)
+##############################################################################
+# Header-only C++20 libraries. sst-basic-blocks needs SIMDE for ARM64 (Apple
+# Silicon) SSE→NEON translation. We create the simde target before adding
+# sst-basic-blocks so it doesn't set SIMDE_UNAVAILABLE.
+
+# SIMDE — portable SIMD intrinsics (SSE on ARM via NEON)
+add_library(simde INTERFACE)
+target_include_directories(simde INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/libs/simde)
+
+# sst-basic-blocks — core DSP utilities (required by sst-filters)
+set(SST_BASIC_BLOCKS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+add_subdirectory(libs/sst-basic-blocks)
+# Propagate SIMDE include paths through sst-basic-blocks to all consumers
+target_link_libraries(sst-basic-blocks INTERFACE simde)
+
+# sst-filters — all Surge XT filter types (GPL3)
+set(SST_FILTERS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(SST_FILTERS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+add_subdirectory(libs/sst-filters)
 
 ##############################################################################
 # VST3 SDK Source Files
@@ -204,6 +226,7 @@ if(APPLE)
         ${ACCELERATE_LIBRARY}
         ${METAL_LIBRARY}
         vstgui
+        sst-filters
     )
 endif()
 

@@ -1,5 +1,6 @@
 #include "KawaiiEditor.h"
 #include "../controller/KawaiiController.h"
+#include "../params/KawaiiFilterTypes.h"
 #include "vstgui/vstgui.h"
 #include "vstgui/lib/controls/cknob.h"
 #include "vstgui/lib/controls/ctextlabel.h"
@@ -282,14 +283,15 @@ void KawaiiEditor::createControls()
     fltTitle->setHoriAlign(CHoriTxtAlign::kLeftText);
     frame->addView(fltTitle);
 
-    // Filter type — dropdown selector (COptionMenu) showing LP/HP/BP/Notch
+    // Filter type — dropdown selector (COptionMenu) showing all 33 sst-filter types
     int typeX = 80;
-    CRect menuRect(typeX, kFilterY, typeX + 80, kFilterY + 22);
+    CRect menuRect(typeX, kFilterY, typeX + 120, kFilterY + 22);
     auto* typeMenu = new COptionMenu(menuRect, this, kParamFilterType);
-    typeMenu->addEntry("Low Pass");
-    typeMenu->addEntry("High Pass");
-    typeMenu->addEntry("Band Pass");
-    typeMenu->addEntry("Notch");
+    {
+        const auto& filterTypes = getFilterTypes();
+        for (int i = 0; i < kNumFilterTypes; i++)
+            typeMenu->addEntry(filterTypes[(size_t)i].name);
+    }
     typeMenu->setFontColor(filterCorona);
     typeMenu->setBackColor(CColor(45, 45, 55, 255));
     typeMenu->setFrameColor(CColor(70, 70, 85, 255));
@@ -298,14 +300,14 @@ void KawaiiEditor::createControls()
     if (getController())
     {
         float normType = static_cast<float>(getController()->getParamNormalized(kParamFilterType));
-        int typeIndex = static_cast<int>(normType * 3 + 0.5f);
+        int typeIndex = static_cast<int>(normType * (kNumFilterTypes - 1) + 0.5f);
         typeMenu->setCurrent(typeIndex);
         typeMenu->setValue(normType);
     }
     frame->addView(typeMenu);
 
     // "Type" label below menu
-    CRect typeLblRect(typeX, kFilterY + 24, typeX + 80, kFilterY + 24 + kLabelH);
+    CRect typeLblRect(typeX, kFilterY + 24, typeX + 120, kFilterY + 24 + kLabelH);
     auto* typeLbl = new CTextLabel(typeLblRect, "Type");
     typeLbl->setFontColor(labelColor);
     typeLbl->setBackColor(CColor(0, 0, 0, 0));
@@ -314,8 +316,39 @@ void KawaiiEditor::createControls()
     typeLbl->setHoriAlign(CHoriTxtAlign::kCenterText);
     frame->addView(typeLbl);
 
-    // Filter knobs — all in one row after the type selector
-    int fKnobStart = 180;
+    // Filter subtype — dropdown selector (0–3 variants per filter type)
+    int subX = typeX + 126;
+    CRect subMenuRect(subX, kFilterY, subX + 60, kFilterY + 22);
+    auto* subMenu = new COptionMenu(subMenuRect, this, kParamFilterSubType);
+    subMenu->addEntry("Sub 1");
+    subMenu->addEntry("Sub 2");
+    subMenu->addEntry("Sub 3");
+    subMenu->addEntry("Sub 4");
+    subMenu->setFontColor(filterCorona);
+    subMenu->setBackColor(CColor(45, 45, 55, 255));
+    subMenu->setFrameColor(CColor(70, 70, 85, 255));
+    subMenu->setFont(kNormalFontSmall);
+    if (getController())
+    {
+        float normSub = static_cast<float>(getController()->getParamNormalized(kParamFilterSubType));
+        int subIndex = static_cast<int>(normSub * 3 + 0.5f);
+        subMenu->setCurrent(subIndex);
+        subMenu->setValue(normSub);
+    }
+    frame->addView(subMenu);
+
+    // "Sub" label below subtype menu
+    CRect subLblRect(subX, kFilterY + 24, subX + 60, kFilterY + 24 + kLabelH);
+    auto* subLbl = new CTextLabel(subLblRect, "Sub");
+    subLbl->setFontColor(labelColor);
+    subLbl->setBackColor(CColor(0, 0, 0, 0));
+    subLbl->setFrameColor(CColor(0, 0, 0, 0));
+    subLbl->setFont(kNormalFontVerySmall);
+    subLbl->setHoriAlign(CHoriTxtAlign::kCenterText);
+    frame->addView(subLbl);
+
+    // Filter knobs — all in one row after the type + subtype selectors
+    int fKnobStart = subX + 70;
     int fKnobY = kFilterY - 4;
 
     filterKnob("Cutoff",  kParamFilterCutoff,  fKnobStart,                    fKnobY);
