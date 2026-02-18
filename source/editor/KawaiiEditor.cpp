@@ -92,6 +92,22 @@ void KawaiiEditor::valueChanged(CControl* control)
     ParamID tag = control->getTag();
     ParamValue value = control->getValue();
 
+    // COptionMenu::getValue() returns the selected item INDEX (0, 1, 2, ...),
+    // NOT a normalized 0-1 value. We must normalize it for the VST3 parameter
+    // system, which always works in normalized 0-1 space.
+    // Without this, selecting filter type 14 sends 14.0 to the processor,
+    // which interprets it as normalized and computes 14*32 = 448, clamped to
+    // the last filter type (S&H). This is why all non-SVF filters sounded
+    // like sample rate reduction — they were ALL mapped to Sample & Hold!
+    if (auto* menu = dynamic_cast<COptionMenu*>(control))
+    {
+        int numEntries = static_cast<int>(menu->getNbEntries());
+        if (numEntries > 1)
+            value = static_cast<double>(menu->getCurrentIndex()) / (numEntries - 1);
+        else
+            value = 0.0;
+    }
+
     if (getController())
     {
         getController()->setParamNormalized(tag, value);

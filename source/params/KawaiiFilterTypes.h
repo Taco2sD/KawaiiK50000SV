@@ -93,11 +93,13 @@ inline const std::array<FilterTypeEntry, kNumFilterTypes>& getFilterTypes()
         { "TriPole",      FM::TriPole,        PB::LowLowLow,SL::UNSUPPORTED, DM::UNSUPPORTED, SM::UNSUPPORTED, false },
 
         // --- Comb — pitched resonance, great for Karplus-Strong-style sounds ---
-        { "Comb+",        FM::Comb,           PB::LP,       SL::Comb_Positive_100, DM::UNSUPPORTED, SM::UNSUPPORTED, true },
-        { "Comb-",        FM::Comb,           PB::LP,       SL::Comb_Negative_100, DM::UNSUPPORTED, SM::UNSUPPORTED, true },
+        // Note: Comb model configs use Slope as the only key (no Passband), so
+        // we must set Passband to UNSUPPORTED to avoid filtering out all configs.
+        { "Comb+",        FM::Comb,           PB::UNSUPPORTED, SL::Comb_Positive_100, DM::UNSUPPORTED, SM::UNSUPPORTED, true },
+        { "Comb-",        FM::Comb,           PB::UNSUPPORTED, SL::Comb_Negative_100, DM::UNSUPPORTED, SM::UNSUPPORTED, true },
 
         // --- Sample & Hold — lo-fi / glitchy ---
-        { "S&H",          FM::SampleAndHold,  PB::LP,       SL::UNSUPPORTED, DM::UNSUPPORTED, SM::UNSUPPORTED, false },
+        { "S&H",          FM::SampleAndHold,  PB::UNSUPPORTED, SL::UNSUPPORTED, DM::UNSUPPORTED, SM::UNSUPPORTED, false },
     }};
     return types;
 }

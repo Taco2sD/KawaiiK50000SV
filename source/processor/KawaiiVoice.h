@@ -260,7 +260,11 @@ public:
         }
 
         filterEnvelope.noteOn();
-        filter.resetVoice(0); // Reset voice 0's filter registers without losing sampleRate
+        // Reset all SIMD voice filter registers without losing sampleRate.
+        // All 4 voices are active (not using setMono), so reset all of them
+        // to prevent stale state from the previous note bleeding through.
+        for (int v = 0; v < 4; v++)
+            filter.resetVoice(v);
         cutoffSmoother.snap();
         resoSmoother.snap();
         filterBlockPos = 0;   // Reset sub-block position
@@ -296,7 +300,9 @@ public:
             float noteVal = static_cast<float>(12.0 * std::log2(std::max(cutoffHz, 1.0) / 440.0));
             float reso = static_cast<float>(std::clamp(smoothedReso, 0.0, 1.0));
 
-            filter.makeCoefficients(0, noteVal, reso);
+            // Make coefficients for ALL 4 SIMD voices (all active, matching library pattern)
+            for (int v = 0; v < 4; v++)
+                filter.makeCoefficients(v, noteVal, reso);
             filter.prepareBlock();
         }
 
@@ -376,7 +382,9 @@ public:
         float noteVal = static_cast<float>(12.0 * std::log2(std::max(cutoffHz, 1.0) / 440.0));
         float r = static_cast<float>(std::clamp(reso, 0.0, 1.0));
 
-        filter.makeCoefficients(0, noteVal, r);
+        // Make coefficients for ALL 4 SIMD voices (all active, matching library pattern)
+        for (int v = 0; v < 4; v++)
+            filter.makeCoefficients(v, noteVal, r);
         filter.prepareBlock();
     }
 
@@ -429,9 +437,10 @@ private:
     // valid variants (cycling through different drive modes, slopes, or
     // submodels depending on what the model supports).
     //
-    // This replaces the old approach of setting individual fields and calling
-    // potentialValuesFor(), which could produce invalid ModelConfig tuples
-    // (e.g., NotchMild drive on an LP passband for VemberClassic).
+    // IMPORTANT: We keep all 4 SIMD voices active and make coefficients for
+    // all 4. This matches the library test patterns and prevents undefined
+    // behavior (NaN/Inf) in inactive SIMD lanes from filter functions that
+    // perform division (K35, etc.). We only read lane 0 via processMonoSample.
     void configureFilter(int typeIndex, int subType)
     {
         const auto& types = getFilterTypes();
@@ -488,17 +497,22 @@ private:
         // 5. Set the validated configuration atomically
         filter.setModelConfiguration(chosen);
 
-        // 6. Allocate delay line memory for Comb filters
+        // 6. Allocate delay line memory for Comb filters (all 4 SIMD voices)
         auto dlSize = sfpp::Filter::requiredDelayLinesSizes(entry.model, chosen);
         if (dlSize > 0)
         {
-            delayLineMemory.resize(dlSize, 0.0f);
+            // Need delay lines for all 4 SIMD voices since all are active
+            delayLineMemory.resize(dlSize * 4, 0.0f);
             std::fill(delayLineMemory.begin(), delayLineMemory.end(), 0.0f);
-            filter.provideDelayLine(0, delayLineMemory.data());
+            for (int v = 0; v < 4; v++)
+                filter.provideDelayLine(v, delayLineMemory.data() + dlSize * v);
         }
 
-        // 7. Validate and initialize the filter
-        filter.setMono();  // Only voice 0 active in the SIMD quad
+        // 7. Validate and initialize the filter.
+        //    Keep all 4 SIMD voices active (the default) — matching library
+        //    test patterns. This ensures all lanes have valid coefficients
+        //    during processing, preventing NaN/Inf from division-by-zero in
+        //    filters like K35. We read only lane 0 via processMonoSample().
         bool ok = filter.prepareInstance();
 
         // If prepareInstance failed, fall back to SVF LP (always valid)
@@ -506,9 +520,25 @@ private:
         {
             filter.setFilterModel(sfpp::FilterModel::CytomicSVF);
             filter.setModelConfiguration(sfpp::ModelConfig(sfpp::Passband::LP));
-            filter.setMono();
             filter.prepareInstance();
         }
+
+        // 8. Re-apply sample rate and block size after prepareInstance's reset().
+        //    While reset() preserves maker sampleRates, this ensures the payload
+        //    and qfuState are in perfect sync with the current sample rate.
+        filter.setSampleRateAndBlockSize(sampleRate, kFilterBlockSize);
+
+        // 9. Prime the filter with initial coefficients for ALL 4 SIMD voices.
+        //    Uses a safe initial cutoff (A440 = noteVal 0) and zero resonance.
+        //    This ensures all SIMD lanes have valid non-zero coefficients before
+        //    any audio processing begins, preventing NaN from uninitialized state.
+        for (int v = 0; v < 4; v++)
+            filter.makeCoefficients(v, 0.f, 0.f);
+        filter.prepareBlock();
+        filter.concludeBlock();
+
+        // 10. Reset sub-block position so the CPU path starts a fresh block
+        filterBlockPos = 0;
 
         currentFilterTypeIndex = typeIndex;
         currentFilterSubType = subType;
