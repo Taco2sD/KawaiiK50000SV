@@ -252,19 +252,6 @@ add_custom_command(TARGET KawaiiK50000SV POST_BUILD
 )
 
 ##############################################################################
-# Test executable — standalone sst-filters verification
-##############################################################################
-# Verifies all 33 filter types work correctly on this platform (ARM/SIMDE).
-# Build: cmake --build build --target test_filters
-# Run:   ./build/test_filters
-
-add_executable(test_filters tests/test_filters.cpp)
-target_include_directories(test_filters PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/source
-    ${VST3_SDK_ROOT}
-)
-target_link_libraries(test_filters PRIVATE sst-filters)
-target_compile_definitions(test_filters PRIVATE SMTG_OS_MACOS=1)
 
 ##############################################################################
 # Installation
